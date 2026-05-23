@@ -3,7 +3,7 @@ use std::io::{self, BufRead};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use function_name::named;
 use jiff::{SignedDuration, Timestamp};
-use log::{info, trace, warn};
+use log::{error, info, trace, warn};
 use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -255,8 +255,7 @@ impl TeslaVehicle {
                 info!("No vehicle data: polling");
                 update(self)?
             }
-            Some((time, _)) => {
-            }
+            Some(_) => {}
         }
 
         let Some(ref data) = self.data else {
@@ -272,6 +271,10 @@ impl TeslaVehicle {
             .get(vehicle_data_url(&self.config.vin))
             .bearer_auth(&token.access_token)
             .send()?;
+
+        if !resp.status().is_success() {
+            error!("Error: {}", resp.status());
+        }
 
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             let token = self.refresh_token()?;

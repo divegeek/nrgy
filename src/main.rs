@@ -40,7 +40,7 @@ type NrgyResult<T> = std::result::Result<T, NrgyError>;
 
 fn main() -> Result<()> {
     env_logger::builder()
-        .filter_level(log::LevelFilter::Warn)
+        .filter_level(log::LevelFilter::Info)
         .filter_module("reqwest", log::LevelFilter::Warn)
         .init();
 
