@@ -12,7 +12,7 @@ use toml_edit::TomlError;
 
 use crate::config::TeslaConfig;
 
-const MIN_POLL_INTERVAL: SignedDuration = SignedDuration::from_mins(1);
+const MIN_POLL_INTERVAL: SignedDuration = SignedDuration::from_mins(5);
 
 const AUTH_BASE: &str = "https://fleet-auth.prd.vn.cloud.tesla.com";
 const API_BASE: &str = "https://192.168.86.230";
@@ -256,7 +256,6 @@ impl TeslaVehicle {
                 update(self)?
             }
             Some((time, _)) => {
-                warn!("Not polling car: {} seconds old", (cur_time - *time).get_seconds());
             }
         }
 

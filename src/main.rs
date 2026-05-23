@@ -16,7 +16,7 @@ mod solar_edge;
 mod tesla;
 mod units;
 
-const NORMAL_POLL_INTERVAL: u64 = 2;
+const NORMAL_POLL_INTERVAL: u64 = 5;
 const SLOW_POLL_INTERVAL: u64 = 30;
 const MIN_CHARGE_AMPS: i8 = 5;
 const MAX_CHARGE_AMPS: i8 = 48;
@@ -40,7 +40,7 @@ type NrgyResult<T> = std::result::Result<T, NrgyError>;
 
 fn main() -> Result<()> {
     env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
+        .filter_level(log::LevelFilter::Warn)
         .filter_module("reqwest", log::LevelFilter::Warn)
         .init();
 
