@@ -3,7 +3,7 @@ use std::io::{self, BufRead};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use function_name::named;
 use jiff::{SignedDuration, Timestamp};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -137,6 +137,15 @@ impl TeslaVehicle {
         })
     }
 
+    pub fn is_full(&mut self) -> TeslaResult<bool> {
+        let charging_state = self.update_state()?.charge_state.charging_state.as_str();
+        Ok(match charging_state {
+            "Complete" => true,
+            "Charging" | "Stopped" | "Disconnected" => false,
+            _ => false,
+        })
+    }
+
     pub fn charging_amps(&mut self) -> TeslaResult<u16> {
         Ok(self.update_state()?.charge_state.charge_amps)
     }
@@ -148,7 +157,7 @@ impl TeslaVehicle {
     #[named]
     pub fn charge_start(&mut self) -> TeslaResult<()> {
         if self.is_charging()? {
-            info!("Got request to start charging, already charging");
+            debug!("Got request to start charging, already charging");
             return Ok(());
         }
 
@@ -199,6 +208,7 @@ impl TeslaVehicle {
         let current_request = self.update_state()?.charge_state.charge_current_request;
         trace!("Got request for {amps} amps, currently {current_request}");
         if current_request == amps as u16 {
+            debug!("Got request for {amps} amps, already set at {current_request}");
             return Ok(());
         }
 
@@ -245,14 +255,14 @@ impl TeslaVehicle {
         let stale_time = cur_time.checked_sub(MIN_POLL_INTERVAL)?;
         match &mut self.data {
             Some((time, data)) if stale_time >= *time => {
-                info!(
+                debug!(
                     "Stale vehicle data ({} seconds old): polling",
                     (cur_time - *time).get_seconds()
                 );
                 update(self)?;
             }
             None => {
-                info!("No vehicle data: polling");
+                debug!("No vehicle data: polling");
                 update(self)?
             }
             Some(_) => {}
@@ -351,7 +361,7 @@ impl TeslaVehicle {
         };
 
         let body = resp.error_for_status()?.text()?;
-        info!("Response: {body}");
+        trace!("Response: {body}");
 
         #[derive(Deserialize, Debug)]
         struct CommandResponseEnvelope {
@@ -463,7 +473,7 @@ impl TeslaVehicle {
 
 fn validate_charging_state(charging_state: &str) {
     match charging_state {
-        "Charging" | "Disconnected" | "Stopped" => (),
+        "Charging" | "Disconnected" | "Stopped" | "Complete" => (),
         _ => warn!("Unknown charging state: {charging_state}"),
     }
 }

@@ -1,8 +1,8 @@
 use std::{thread::sleep, time::Duration};
 
 use anyhow::Result;
-use jiff::{ToSpan, Unit, Zoned};
-use log::{error, info, trace, warn};
+use jiff::Zoned;
+use log::{debug, error, info, trace, warn};
 use thiserror::Error;
 
 use crate::{
@@ -25,7 +25,6 @@ const TYPICAL_VOLTS: i16 = 245;
 const MIN_CHARGE_WATTS: i32 = MIN_CHARGE_AMPS as i32 * TYPICAL_VOLTS as i32;
 const URGENT_CHARGE_THRESHOLD: u8 = 40;
 const SHOULD_CHARGE_THRESHOLD: u8 = 60;
-const NORMAL_CHARGE_THRESHOLD: u8 = 95;
 
 #[derive(Error, Debug)]
 enum NrgyError {
@@ -41,7 +40,7 @@ type NrgyResult<T> = std::result::Result<T, NrgyError>;
 
 fn main() -> Result<()> {
     env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .filter_module("reqwest", log::LevelFilter::Warn)
         .init();
 
@@ -57,14 +56,16 @@ fn main() -> Result<()> {
     loop {
         match poll(&mut vehicle, &solar) {
             Ok(Some(new_interval)) => {
-                info!("Changing poll interval from {poll_interval} to {new_interval}");
+                if new_interval != poll_interval {
+                    info!("Changing poll interval from {poll_interval} to {new_interval}");
+                }
                 poll_interval = new_interval
             }
             Ok(None) => (),
             Err(NrgyError::TeslaError(TeslaError::ReqwestError(e))) => {
                 error!("Tesla request error {e}");
                 poll_interval = NORMAL_POLL_INTERVAL;
-            },
+            }
             Err(e) => {
                 error!("Error {e}")
             }
@@ -83,6 +84,12 @@ fn poll(vehicle: &mut TeslaVehicle, solar: &SolarEdge) -> NrgyResult<Option<u64>
     }
 
     let soc = vehicle.battery_soc()?;
+
+    if vehicle.is_full()? {
+        info!("Vehicle is full");
+        return Ok(Some(SLOW_POLL_INTERVAL));
+    }
+
     let charge_amps = if soc < URGENT_CHARGE_THRESHOLD {
         warn!("SoC {soc} below {URGENT_CHARGE_THRESHOLD}.  Need to charge.");
         MAX_CHARGE_AMPS
@@ -94,7 +101,7 @@ fn poll(vehicle: &mut TeslaVehicle, solar: &SolarEdge) -> NrgyResult<Option<u64>
         } else {
             0
         }
-    } else if soc < NORMAL_CHARGE_THRESHOLD {
+    } else {
         let now = Zoned::now();
         if now.hour() > 20 || now.hour() < 8 {
             trace!("It's dark, assuming no excess solar, waiting until morning");
@@ -108,12 +115,6 @@ fn poll(vehicle: &mut TeslaVehicle, solar: &SolarEdge) -> NrgyResult<Option<u64>
             info!("No excess solar.")
         }
         excess_amps
-    } else {
-        if vehicle.is_charging()? {
-            info!("Vehicle full.  Stopping charge.");
-            new_poll_interval = Some(SLOW_POLL_INTERVAL);
-        }
-        0
     };
 
     if charge_amps > 0 {
@@ -145,6 +146,9 @@ fn excess_amps(vehicle: &mut TeslaVehicle, solar: &solar_edge::SolarEdge) -> Nrg
     } else {
         0
     };
-    trace!("Excess power {excess_power} amps {excess_amps}");
+    debug!(
+        "Excess power {excess_power} ({} + {car_power}) amps {excess_amps}",
+        power_flow.grid_watts
+    );
     Ok(excess_amps)
 }
