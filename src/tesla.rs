@@ -1,10 +1,15 @@
-use std::io::{self, BufRead};
+use std::{
+    io::{self, BufRead},
+    thread::sleep,
+    time::Duration,
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use function_name::named;
-use jiff::{SignedDuration, Timestamp};
+use jiff::{SignedDuration, Timestamp, Zoned};
 use log::{debug, error, info, trace, warn};
 use rand::Rng;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -41,6 +46,8 @@ pub enum TeslaError {
     JsonError(#[from] serde_json::Error),
     #[error("Jiff error: {0}")]
     JiffError(#[from] jiff::Error),
+    #[error("Car sleeping: {0}")]
+    CarSleeping(String),
 }
 
 pub type TeslaResult<T> = Result<T, TeslaError>;
@@ -101,6 +108,7 @@ pub struct TeslaVehicle {
     config: TeslaConfig,
     http: reqwest::blocking::Client,
     data: Option<(Timestamp, VehicleData)>,
+    last_wake: Option<Timestamp>,
 }
 
 #[expect(dead_code)]
@@ -113,6 +121,7 @@ impl TeslaVehicle {
                 .build()
                 .expect("Failed to build HTTP client"),
             data: None,
+            last_wake: None,
         }
     }
 
@@ -243,6 +252,21 @@ impl TeslaVehicle {
         }
     }
 
+    #[named]
+    pub fn wake_up(&mut self) -> TeslaResult<()> {
+        let now = Timestamp::now();
+        if let Some(last_wake) = self.last_wake {
+            let delta = (now - last_wake).get_hours();
+            if delta < 6 {
+                warn!("Only {delta} hours since last wake, refusing",)
+            }
+        }
+        warn!("Sending wakeup");
+        _ = self.send_command(function_name!(), serde_json::json!({}))?;
+        self.last_wake = Some(now);
+        Ok(())
+    }
+
     fn update_state<'a>(&'a mut self) -> TeslaResult<&'a VehicleData> {
         let update = |vehicle: &mut TeslaVehicle| -> TeslaResult<()> {
             let vehicle_data = vehicle.get_vehicle_data()?;
@@ -255,15 +279,19 @@ impl TeslaVehicle {
         let stale_time = cur_time.checked_sub(MIN_POLL_INTERVAL)?;
         match &mut self.data {
             Some((time, data)) if stale_time >= *time => {
-                debug!(
-                    "Stale vehicle data ({} seconds old): polling",
-                    (cur_time - *time).get_seconds()
-                );
-                update(self)?;
+                let update_age = (cur_time - *time).get_seconds();
+                debug!("Stale vehicle data ({update_age} seconds old): polling",);
+                if let Err(e) = update(self) {
+                    self.handle_sleeping_car(e, update_age)?;
+                    update(self)?
+                }
             }
             None => {
                 debug!("No vehicle data: polling");
-                update(self)?
+                if let Err(e) = update(self) {
+                    self.handle_sleeping_car(e, i64::MAX)?;
+                    update(self)?
+                }
             }
             Some(_) => {}
         }
@@ -272,6 +300,20 @@ impl TeslaVehicle {
             unreachable!()
         };
         Ok(&data.1)
+    }
+
+    fn handle_sleeping_car(&mut self, err: TeslaError, update_age: i64) -> TeslaResult<()> {
+        if let TeslaError::CarSleeping(s) = err {
+            if is_prime_time() && update_age > 7200 {
+                self.wake_up()?;
+                sleep(Duration::from_secs(5));
+                Ok(())
+            } else {
+                Err(TeslaError::CarSleeping(s))
+            }
+        } else {
+            Err(err)?
+        }
     }
 
     pub fn get_vehicle_data(&self) -> TeslaResult<VehicleData> {
@@ -286,12 +328,14 @@ impl TeslaVehicle {
             error!("Error: {}", resp.status());
         }
 
-        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let resp = if resp.status() == StatusCode::UNAUTHORIZED {
             let token = self.refresh_token()?;
             self.http
                 .get(vehicle_data_url(&self.config.vin))
                 .bearer_auth(&token.access_token)
                 .send()?
+        } else if resp.status() == StatusCode::REQUEST_TIMEOUT {
+            Err(TeslaError::CarSleeping(resp.status().to_string()))?
         } else {
             resp
         };
@@ -469,6 +513,11 @@ impl TeslaVehicle {
     //     }
     //     Ok(partner_token.as_ref().cloned().unwrap())
     // }
+}
+
+fn is_prime_time() -> bool {
+    let now = Zoned::now();
+    now.hour() > 11 && now.hour() < 18
 }
 
 fn validate_charging_state(charging_state: &str) {
