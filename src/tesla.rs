@@ -6,7 +6,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use function_name::named;
-use jiff::{SignedDuration, Timestamp, Zoned};
+use jiff::{Timestamp, Zoned};
 use log::{debug, error, info, trace, warn};
 use rand::Rng;
 use reqwest::StatusCode;
@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use toml_edit::TomlError;
 
-use crate::config::TeslaConfig;
+use crate::{config::TeslaConfig, poll_thread::Pollable};
 
-const MIN_POLL_INTERVAL: SignedDuration = SignedDuration::from_mins(5);
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 const AUTH_BASE: &str = "https://fleet-auth.prd.vn.cloud.tesla.com";
 const API_BASE: &str = "https://192.168.86.230";
@@ -63,7 +63,7 @@ pub struct VehicleDataResponseEnvelope {
 }
 
 #[expect(unused)]
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct VehicleData {
     pub charge_state: VehicleChargeState,
     pub drive_state: VehicleDriveState,
@@ -71,7 +71,7 @@ pub struct VehicleData {
 }
 
 #[expect(unused)]
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct VehicleChargeState {
     pub battery_level: u8,
     pub charge_amps: u16,
@@ -87,13 +87,13 @@ pub struct VehicleChargeState {
 }
 
 #[expect(unused)]
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct VehicleDriveState {
     pub latitude: f64,
     pub longitude: f64,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct VehicleState {
     pub homelink_nearby: bool,
 }
@@ -104,11 +104,33 @@ struct CommandResponse {
     pub reason: String,
 }
 
+#[derive(Debug, Default)]
 pub struct TeslaVehicle {
     config: TeslaConfig,
     http: reqwest::blocking::Client,
-    data: Option<(Timestamp, VehicleData)>,
-    last_wake: Option<Timestamp>,
+    pub data: VehicleData,
+    pub last_update: Option<Timestamp>,
+    pub last_wake: Option<Timestamp>,
+}
+
+impl Pollable for TeslaVehicle {
+    fn name(&self) -> &'static str {
+        "TeslaVehicle"
+    }
+
+    fn init(&mut self) -> crate::NrgyResult<()> {
+        self.update_state()?;
+        Ok(())
+    }
+
+    fn poll(&mut self) -> crate::NrgyResult<()> {
+        self.data = self.get_vehicle_data()?;
+        Ok(())
+    }
+
+    fn default_interval(&self) -> Duration {
+        DEFAULT_POLL_INTERVAL
+    }
 }
 
 #[expect(dead_code)]
@@ -120,59 +142,58 @@ impl TeslaVehicle {
                 .danger_accept_invalid_certs(true)
                 .build()
                 .expect("Failed to build HTTP client"),
-            data: None,
-            last_wake: None,
+            ..Default::default()
         }
     }
 
-    pub fn is_home(&mut self) -> TeslaResult<bool> {
-        Ok(self.update_state()?.vehicle_state.homelink_nearby)
+    pub fn is_home(&self) -> bool {
+        self.data.vehicle_state.homelink_nearby
     }
 
-    pub fn plugged_in(&mut self) -> TeslaResult<bool> {
-        Ok(self.update_state()?.charge_state.charging_state != "Disconnected")
+    pub fn plugged_in(&self) -> bool {
+        self.data.charge_state.charging_state != "Disconnected"
     }
 
-    pub fn battery_soc(&mut self) -> TeslaResult<u8> {
-        Ok(self.update_state()?.charge_state.battery_level)
+    pub fn battery_soc(&mut self) -> u8 {
+        self.data.charge_state.battery_level
     }
 
-    pub fn is_charging(&mut self) -> TeslaResult<bool> {
-        let charging_state = self.update_state()?.charge_state.charging_state.as_str();
-        Ok(match charging_state {
+    pub fn is_charging(&self) -> bool {
+        let charging_state = self.data.charge_state.charging_state.as_str();
+        match charging_state {
             "Charging" => true,
             "Stopped" | "Disconnected" => false,
             _ => false,
-        })
+        }
     }
 
-    pub fn is_full(&mut self) -> TeslaResult<bool> {
-        let charging_state = self.update_state()?.charge_state.charging_state.as_str();
-        Ok(match charging_state {
+    pub fn is_full(&self) -> bool {
+        let charging_state = self.data.charge_state.charging_state.as_str();
+        match charging_state {
             "Complete" => true,
             "Charging" | "Stopped" | "Disconnected" => false,
             _ => false,
-        })
+        }
     }
 
-    pub fn charging_amps(&mut self) -> TeslaResult<u16> {
-        Ok(self.update_state()?.charge_state.charge_amps)
+    pub fn charging_amps(&self) -> u16 {
+        self.data.charge_state.charge_amps
     }
 
-    pub fn charge_limit(&mut self) -> TeslaResult<u8> {
-        Ok(self.update_state()?.charge_state.charge_limit_soc)
+    pub fn charge_limit(&self) -> u8 {
+        self.data.charge_state.charge_limit_soc
     }
 
     #[named]
-    pub fn charge_start(&mut self) -> TeslaResult<()> {
-        if self.is_charging()? {
+    pub fn charge_start(&self) -> TeslaResult<()> {
+        if self.is_charging() {
             debug!("Got request to start charging, already charging");
             return Ok(());
         }
 
         info!(
             "Sending charge start to car (state: {})",
-            self.update_state()?.charge_state.charging_state
+            self.data.charge_state.charging_state
         );
         let resp = self.send_command(function_name!(), serde_json::json!({}))?;
         if !resp.result {
@@ -192,7 +213,7 @@ impl TeslaVehicle {
 
     #[named]
     pub fn charge_stop(&mut self) -> TeslaResult<()> {
-        if !self.is_charging()? {
+        if !self.is_charging() {
             info!("Got request to stop charging, not charging");
             return Ok(());
         }
@@ -252,7 +273,6 @@ impl TeslaVehicle {
         }
     }
 
-    #[named]
     pub fn wake_up(&mut self) -> TeslaResult<()> {
         let now = Timestamp::now();
         if let Some(last_wake) = self.last_wake {
@@ -261,45 +281,49 @@ impl TeslaVehicle {
                 warn!("Only {delta} hours since last wake, refusing",)
             }
         }
+
         warn!("Sending wakeup");
-        _ = self.send_command(function_name!(), serde_json::json!({}))?;
+        let vin = &self.config.vin;
+        let make_req = |token: &str| {
+            self.http
+                .post(format!("{API_BASE}/api/1/vehicles/{vin}/wake_up"))
+                .bearer_auth(token)
+        };
+
+        let token = self.load_user_token()?;
+        let resp = make_req(&token.access_token).send()?;
+
+        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let token = self.refresh_token()?;
+            make_req(&token.access_token).send()?
+        } else {
+            resp
+        };
+
+        let body = resp.error_for_status()?.text()?;
+        trace!("Response: {body}");
         self.last_wake = Some(now);
+
         Ok(())
     }
 
-    fn update_state<'a>(&'a mut self) -> TeslaResult<&'a VehicleData> {
-        let update = |vehicle: &mut TeslaVehicle| -> TeslaResult<()> {
-            let vehicle_data = vehicle.get_vehicle_data()?;
-            trace!("Got vehicle data: {vehicle_data:?}");
-            vehicle.data = Some((Timestamp::now(), vehicle_data));
-            Ok(())
+    fn update_state(&mut self) -> TeslaResult<&VehicleData> {
+        let update_age =
+            (Timestamp::now() - self.last_update.unwrap_or(Timestamp::MIN)).get_seconds();
+
+        let vehicle_data = match self.get_vehicle_data() {
+            Ok(data) => data,
+            Err(e) => {
+                self.handle_sleeping_car(e, update_age)?;
+                self.get_vehicle_data()?
+            }
         };
 
-        let cur_time = Timestamp::now();
-        let stale_time = cur_time.checked_sub(MIN_POLL_INTERVAL)?;
-        match &mut self.data {
-            Some((time, data)) if stale_time >= *time => {
-                let update_age = (cur_time - *time).get_seconds();
-                debug!("Stale vehicle data ({update_age} seconds old): polling",);
-                if let Err(e) = update(self) {
-                    self.handle_sleeping_car(e, update_age)?;
-                    update(self)?
-                }
-            }
-            None => {
-                debug!("No vehicle data: polling");
-                if let Err(e) = update(self) {
-                    self.handle_sleeping_car(e, i64::MAX)?;
-                    update(self)?
-                }
-            }
-            Some(_) => {}
-        }
+        trace!("Got vehicle data: {vehicle_data:?}");
+        self.data = vehicle_data;
+        self.last_update = Some(Timestamp::now());
 
-        let Some(ref data) = self.data else {
-            unreachable!()
-        };
-        Ok(&data.1)
+        Ok(&self.data)
     }
 
     fn handle_sleeping_car(&mut self, err: TeslaError, update_age: i64) -> TeslaResult<()> {

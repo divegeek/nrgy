@@ -6,10 +6,11 @@ use std::path::PathBuf;
 pub struct Config {
     pub tesla: TeslaConfig,
     pub solar_edge: SolarEdgeconfig,
+    pub open_evse: OpenEvseConfig,
 }
 
 #[expect(unused)]
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Default)]
 pub struct TeslaConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -19,10 +20,17 @@ pub struct TeslaConfig {
     pub refresh_token: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct SolarEdgeconfig {
     pub site_id: u32,
     pub api_key: String,
+}
+
+#[derive(Deserialize)]
+pub struct OpenEvseConfig {
+    pub hostname: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 pub fn load() -> Result<Config, Box<dyn std::error::Error>> {
