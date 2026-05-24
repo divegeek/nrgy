@@ -18,6 +18,7 @@ mod units;
 
 const NORMAL_POLL_INTERVAL: u64 = 5;
 const SLOW_POLL_INTERVAL: u64 = 30;
+const VERY_SLOW_POLL_INTERVAL: u64 = 90;
 const MIN_CHARGE_AMPS: i8 = 5;
 const MAX_CHARGE_AMPS: i8 = 48;
 const TYPICAL_VOLTS: i16 = 245;
@@ -60,7 +61,13 @@ fn main() -> Result<()> {
                 poll_interval = new_interval
             }
             Ok(None) => (),
-            Err(e) => error!("Error {e}"),
+            Err(NrgyError::TeslaError(TeslaError::ReqwestError(e))) => {
+                error!("Tesla request error {e}");
+                poll_interval = NORMAL_POLL_INTERVAL;
+            },
+            Err(e) => {
+                error!("Error {e}")
+            }
         }
 
         info!("Sleeping for {poll_interval} minutes");
@@ -91,7 +98,7 @@ fn poll(vehicle: &mut TeslaVehicle, solar: &SolarEdge) -> NrgyResult<Option<u64>
         let now = Zoned::now();
         if now.hour() > 20 || now.hour() < 8 {
             trace!("It's dark, assuming no excess solar, waiting until morning");
-            return Ok(Some(minutes_to_8am(now)?));
+            return Ok(Some(VERY_SLOW_POLL_INTERVAL));
         }
 
         let excess_amps = excess_amps(vehicle, &solar)?;
@@ -118,20 +125,6 @@ fn poll(vehicle: &mut TeslaVehicle, solar: &SolarEdge) -> NrgyResult<Option<u64>
     }
 
     Ok(new_poll_interval)
-}
-
-fn minutes_to_8am(now: Zoned) -> NrgyResult<u64> {
-    let mut target = now
-        .clone()
-        .with()
-        .time(jiff::civil::time(8, 0, 0, 0))
-        .build()?;
-    if now > target {
-        target = target.checked_add(1.day())?;
-    }
-    let span = now.until(&target)?;
-    let total_minutes = span.total(Unit::Minute)?;
-    Ok(total_minutes as u64)
 }
 
 fn excess_amps(vehicle: &mut TeslaVehicle, solar: &solar_edge::SolarEdge) -> NrgyResult<i8> {
