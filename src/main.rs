@@ -1,4 +1,4 @@
-use std::{thread::sleep, time::Duration};
+use std::{io::Write as _, thread::sleep, time::Duration};
 
 use anyhow::Result;
 use jiff::Zoned;
@@ -7,9 +7,10 @@ use solaredge_modbus::{MeterClient, SlotNumber};
 use thiserror::Error;
 
 use crate::{
+    NrgyError::ModbusError,
+    config::SolarEdgeModbusConfig,
     open_evse::{EvseError, OpenEvse},
     poll_thread::PollThread,
-    solar_edge::SolarEdgeError,
     tesla::{TeslaError, TeslaVehicle},
 };
 
@@ -17,7 +18,6 @@ mod config;
 mod open_evse;
 mod poll_thread;
 mod rmp;
-mod solar_edge;
 mod tesla;
 mod units;
 
@@ -32,8 +32,6 @@ const SHOULD_CHARGE_THRESHOLD: u8 = 60;
 enum NrgyError {
     #[error("Tesla error: {0}")]
     TeslaError(#[from] TeslaError),
-    #[error("SolarEdge error: {0}")]
-    SolarEdgeError(#[from] SolarEdgeError),
     #[error("Time error: {0}")]
     TimeError(#[from] jiff::Error),
     #[error("OpenEVSE error: {0}")]
@@ -49,25 +47,21 @@ fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Debug)
         .filter_module("ureq", log::LevelFilter::Warn)
         .filter_module("rustls", log::LevelFilter::Warn)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}] - {}",
+                Zoned::now().strftime("%D %l:%M:%S.%3f %p %Z"),
+                record.level(),
+                record.args()
+            )
+        })
         .init();
 
     let config = config::load().expect("Failed to load config");
     let vehicle = TeslaVehicle::new(config.tesla);
     let mut open_evse = OpenEvse::new(config.open_evse);
-    let mut solar_meter = MeterClient::new(
-        &config.solaredge_modbus.host,
-        config.solaredge_modbus.port,
-        config.solaredge_modbus.device_id,
-        match config.solaredge_modbus.slot {
-            1 => SlotNumber::One,
-            2 => SlotNumber::Two,
-            3 => SlotNumber::Three,
-            _ => panic!(
-                "Invalid SolarEdge modbus meter slot {}",
-                config.solaredge_modbus.slot
-            ),
-        },
-    )?;
+    let mut solar_meter = create_modbus_client(&config.solaredge_modbus)?;
 
     if std::env::args().any(|a| a == "--auth") {
         vehicle.authenticate()?;
@@ -84,6 +78,10 @@ fn main() -> Result<()> {
             Err(NrgyError::TeslaError(TeslaError::UreqError(e))) => {
                 error!("Tesla request error {e}");
             }
+            Err(ModbusError(e)) => {
+                error!("Modbus error {e}, restarting Modbus client");
+                solar_meter = create_modbus_client(&config.solaredge_modbus)?;
+            }
             Err(e) => {
                 error!("Error {e}")
             }
@@ -92,18 +90,32 @@ fn main() -> Result<()> {
     }
 }
 
+fn create_modbus_client(config: &SolarEdgeModbusConfig) -> NrgyResult<MeterClient> {
+    Ok(MeterClient::new(
+        &config.host,
+        config.port,
+        config.device_id,
+        match config.slot {
+            1 => SlotNumber::One,
+            2 => SlotNumber::Two,
+            3 => SlotNumber::Three,
+            _ => panic!("Invalid SolarEdge modbus meter slot {}", config.slot),
+        },
+    )?)
+}
+
 fn poll(
     vehicle: &PollThread<TeslaVehicle>,
     open_evse: &mut OpenEvse,
     solar_meter: &mut MeterClient,
 ) -> NrgyResult<()> {
     if !open_evse.plugged_in()? {
-        debug!("Not plugged in");
+        trace!("Not plugged in");
         return Ok(());
     }
 
     if vehicle.lock().is_full() {
-        debug!("Vehicle is full");
+        trace!("Vehicle is full");
         return Ok(());
     }
 

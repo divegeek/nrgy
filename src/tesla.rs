@@ -6,8 +6,10 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use function_name::named;
+use ignorable::PartialEq;
 use jiff::{Timestamp, Zoned};
 use log::{debug, error, info, trace, warn};
+use pretty_assertions::Comparison;
 use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -61,16 +63,13 @@ pub struct VehicleDataResponseEnvelope {
     response: VehicleData,
 }
 
-#[expect(unused)]
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 pub struct VehicleData {
     pub charge_state: VehicleChargeState,
-    pub drive_state: VehicleDriveState,
     pub vehicle_state: VehicleState,
 }
 
-#[expect(unused)]
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 pub struct VehicleChargeState {
     pub battery_level: u8,
     pub charge_amps: u16,
@@ -85,14 +84,7 @@ pub struct VehicleChargeState {
     pub minutes_to_full_charge: u16,
 }
 
-#[expect(unused)]
-#[derive(Deserialize, Debug, Default)]
-pub struct VehicleDriveState {
-    pub latitude: f64,
-    pub longitude: f64,
-}
-
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 pub struct VehicleState {
     pub homelink_nearby: bool,
 }
@@ -345,6 +337,12 @@ impl TeslaVehicle {
         };
 
         trace!("Got vehicle data: {vehicle_data:?}");
+        if self.data != vehicle_data {
+            debug!(
+                "Vehicle state changed: {}",
+                Comparison::new(&self.data, &vehicle_data)
+            );
+        }
         self.data = vehicle_data;
         self.last_update = Some(Timestamp::now());
 

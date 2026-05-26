@@ -2,30 +2,20 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-#[expect(unused)]
 #[derive(Deserialize)]
 pub struct Config {
     pub tesla: TeslaConfig,
-    pub solar_edge: SolarEdgeConfig,
     pub open_evse: OpenEvseConfig,
     pub solaredge_modbus: SolarEdgeModbusConfig,
 }
 
-#[expect(unused)]
 #[derive(Deserialize, Debug, Default)]
 pub struct TeslaConfig {
     pub client_id: String,
     pub client_secret: String,
-    pub private_key: String,
     pub vin: String,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SolarEdgeConfig {
-    pub site_id: u32,
-    pub api_key: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
