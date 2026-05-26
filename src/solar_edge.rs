@@ -1,17 +1,18 @@
+#![expect(dead_code)]
+
 use std::time::Duration;
 
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{config::SolarEdgeconfig, poll_thread::Pollable};
+use crate::{config::SolarEdgeConfig, poll_thread::Pollable};
 
 const API_BASE: &str = "https://monitoringapi.solaredge.com";
 
 #[derive(Error, Debug)]
 pub enum SolarEdgeError {
     #[error("Request error: {0}")]
-    ReqwestError(#[from] reqwest::Error),
+    UreqError(#[from] ureq::Error),
 }
 
 pub type SolarEdgeResult<T> = std::result::Result<T, SolarEdgeError>;
@@ -28,13 +29,12 @@ pub struct PowerFlow {
     /// Battery state of charge as a percentage (0–100), or None if no battery.
     pub battery_soc: Option<u8>,
     /// Battery power in kW. Positive = charging, negative = discharging. None if no battery.
-    pub battery_kw: Option<f64>,
+    pub battery_watts: Option<f64>,
 }
 
-#[derive(Debug, Default)]
 pub struct SolarEdge {
-    config: SolarEdgeconfig,
-    http: reqwest::blocking::Client,
+    config: SolarEdgeConfig,
+    http: ureq::Agent,
     pub power_flow: PowerFlow,
 }
 
@@ -57,25 +57,21 @@ impl Pollable for SolarEdge {
 }
 
 impl SolarEdge {
-    pub fn new(config: SolarEdgeconfig) -> Self {
+    pub fn new(config: SolarEdgeConfig) -> Self {
         SolarEdge {
             config,
-            http: Client::new(),
-            ..Default::default()
+            http: ureq::agent(),
+            power_flow: PowerFlow::default(),
         }
     }
 
     pub fn power_flow(&self) -> SolarEdgeResult<PowerFlow> {
-        let flow = self
-            .http
-            .get(format!(
-                "{API_BASE}/site/{}/currentPowerFlow?api_key={}",
-                self.config.site_id, self.config.api_key
-            ))
-            .send()?
-            .error_for_status()?
-            .json::<Response>()?
-            .flow;
+        let url = format!(
+            "{API_BASE}/site/{}/currentPowerFlow?api_key={}",
+            self.config.site_id, self.config.api_key
+        );
+        let mut resp = self.http.get(&url).call()?;
+        let flow = resp.body_mut().read_json::<Response>()?.flow;
 
         let exporting = flow
             .connections
@@ -93,15 +89,15 @@ impl SolarEdge {
             pv_watts: flow.pv.current_power * 1000.0,
             load_watts: flow.load.current_power * 1000.0,
             battery_soc: flow.storage.as_ref().map(|s| s.charge_level),
-            battery_kw: flow.storage.map(|s| {
+            battery_watts: flow.storage.map(|s| {
                 let charging = flow
                     .connections
                     .iter()
                     .any(|c| c.to.eq_ignore_ascii_case("storage"));
                 if charging {
-                    s.current_power
+                    s.current_power * 1000.0
                 } else {
-                    -s.current_power
+                    -s.current_power * 1000.0
                 }
             }),
         })

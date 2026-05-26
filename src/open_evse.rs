@@ -1,8 +1,8 @@
 use std::time::Duration;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use jiff::civil::DateTime;
 use log::trace;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -15,9 +15,7 @@ pub enum EvseError {
     #[error("Unexpected response: {0}")]
     ParseError(String),
     #[error("Request error: {0}")]
-    ReqwestError(#[from] reqwest::Error),
-    #[error("JSON error: {0}")]
-    JsonError(#[from] serde_json::Error),
+    UreqError(#[from] ureq::Error),
     #[error("Not charging")]
     NotCharging,
     #[error("No clock installed")]
@@ -117,11 +115,11 @@ pub struct OpenEvseTimer {
     end: Option<(u8, u8)>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct OpenEvse {
     base_url: String,
     credentials: Option<(String, String)>,
-    http: Client,
+    http: ureq::Agent,
     pub state: EvseState,
     pub flags: EvseFlags,
     pub temperature: Temperature,
@@ -163,8 +161,15 @@ impl OpenEvse {
         OpenEvse {
             base_url: format!("http://{}", config.hostname),
             credentials: config.username.zip(config.password),
-            http: Client::new(),
-            ..Default::default()
+            http: ureq::agent(),
+            state: EvseState::default(),
+            flags: EvseFlags::default(),
+            temperature: Temperature::default(),
+            current_capacity: 0,
+            current_capacity_range: (0, 0),
+            timer: OpenEvseTimer::default(),
+            charging_current: 0.0,
+            charging_voltage: 0.0,
         }
     }
 
@@ -508,7 +513,10 @@ impl OpenEvse {
 
         let mut req = self.http.get(&url);
         if let Some((user, pass)) = &self.credentials {
-            req = req.basic_auth(user, Some(pass));
+            req = req.header(
+                "Authorization",
+                &format!("Basic {}", STANDARD.encode(format!("{user}:{pass}"))),
+            );
         }
 
         #[derive(Deserialize)]
@@ -516,7 +524,8 @@ impl OpenEvse {
             ret: String,
         }
 
-        let resp: Response = req.send()?.error_for_status()?.json()?;
+        let mut resp = req.call()?;
+        let resp: Response = resp.body_mut().read_json()?;
 
         // Response format: "$OK arg1 arg2^checksum" or "$NK^checksum"
         let ret = resp.ret.trim_start_matches('$');

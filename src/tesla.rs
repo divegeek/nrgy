@@ -9,7 +9,6 @@ use function_name::named;
 use jiff::{Timestamp, Zoned};
 use log::{debug, error, info, trace, warn};
 use rand::Rng;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -35,7 +34,7 @@ pub enum TeslaError {
     #[error("Unknown response {1} to {0}")]
     UnknownCommandResponse(&'static str, String),
     #[error("Request error: {0}")]
-    ReqwestError(#[from] reqwest::Error),
+    UreqError(#[from] ureq::Error),
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Authentication error: {0}")]
@@ -104,10 +103,9 @@ struct CommandResponse {
     pub reason: String,
 }
 
-#[derive(Debug, Default)]
 pub struct TeslaVehicle {
     config: TeslaConfig,
-    http: reqwest::blocking::Client,
+    http: ureq::Agent,
     pub data: VehicleData,
     pub last_update: Option<Timestamp>,
     pub last_wake: Option<Timestamp>,
@@ -119,12 +117,28 @@ impl Pollable for TeslaVehicle {
     }
 
     fn init(&mut self) -> crate::NrgyResult<()> {
-        self.update_state()?;
-        Ok(())
+        match self.update_state() {
+            Ok(_) => Ok(()),
+            Err(e) => match e {
+                TeslaError::CarSleeping(_) => {
+                    info!("Car is asleep.  Assuming full.");
+                    self.data = VehicleData {
+                        charge_state: VehicleChargeState {
+                            battery_level: 80,
+                            charging_state: "Complete".to_string(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    Ok(())
+                }
+                e => Err(e)?,
+            },
+        }
     }
 
     fn poll(&mut self) -> crate::NrgyResult<()> {
-        self.data = self.get_vehicle_data()?;
+        self.update_state()?;
         Ok(())
     }
 
@@ -138,11 +152,17 @@ impl TeslaVehicle {
     pub fn new(config: TeslaConfig) -> Self {
         TeslaVehicle {
             config,
-            http: reqwest::blocking::Client::builder()
-                .danger_accept_invalid_certs(true)
+            http: ureq::Agent::config_builder()
+                .tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .disable_verification(true)
+                        .build(),
+                )
                 .build()
-                .expect("Failed to build HTTP client"),
-            ..Default::default()
+                .new_agent(),
+            data: VehicleData::default(),
+            last_update: None,
+            last_wake: None,
         }
     }
 
@@ -185,9 +205,9 @@ impl TeslaVehicle {
     }
 
     #[named]
-    pub fn charge_start(&self) -> TeslaResult<()> {
+    pub fn charge_start(&mut self) -> TeslaResult<()> {
         if self.is_charging() {
-            debug!("Got request to start charging, already charging");
+            trace!("Got request to start charging, already charging");
             return Ok(());
         }
 
@@ -207,6 +227,7 @@ impl TeslaVehicle {
                 ))?,
             }
         } else {
+            self.data.charge_state.charging_state = "Charging".into();
             Ok(())
         }
     }
@@ -214,7 +235,7 @@ impl TeslaVehicle {
     #[named]
     pub fn charge_stop(&mut self) -> TeslaResult<()> {
         if !self.is_charging() {
-            info!("Got request to stop charging, not charging");
+            trace!("Got request to stop charging, not charging");
             return Ok(());
         }
 
@@ -229,6 +250,7 @@ impl TeslaVehicle {
                 ))?,
             }
         } else {
+            self.data.charge_state.charging_state = "Stopped".into();
             Ok(())
         }
     }
@@ -252,6 +274,7 @@ impl TeslaVehicle {
                 resp.reason,
             ))?
         } else {
+            self.data.charge_state.charge_amps = amps as u16;
             Ok(())
         }
     }
@@ -284,23 +307,25 @@ impl TeslaVehicle {
 
         warn!("Sending wakeup");
         let vin = &self.config.vin;
+        let url = format!("{API_BASE}/api/1/vehicles/{vin}/wake_up");
+        let agent = self.http.clone();
         let make_req = |token: &str| {
-            self.http
-                .post(format!("{API_BASE}/api/1/vehicles/{vin}/wake_up"))
-                .bearer_auth(token)
+            agent
+                .post(&url)
+                .header("Authorization", &format!("Bearer {token}"))
         };
 
         let token = self.load_user_token()?;
-        let resp = make_req(&token.access_token).send()?;
-
-        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let token = self.refresh_token()?;
-            make_req(&token.access_token).send()?
-        } else {
-            resp
+        let resp = match make_req(&token.access_token).send(()) {
+            Ok(r) => r,
+            Err(ureq::Error::StatusCode(401)) => {
+                let token = self.refresh_token()?;
+                make_req(&token.access_token).send(())?
+            }
+            Err(e) => return Err(e.into()),
         };
 
-        let body = resp.error_for_status()?.text()?;
+        let body = resp.into_body().read_to_string()?;
         trace!("Response: {body}");
         self.last_wake = Some(now);
 
@@ -341,32 +366,35 @@ impl TeslaVehicle {
     }
 
     pub fn get_vehicle_data(&self) -> TeslaResult<VehicleData> {
+        let url = vehicle_data_url(&self.config.vin);
+        let agent = self.http.clone();
+        let make_req = |token: &str| {
+            agent
+                .get(&url)
+                .header("Authorization", &format!("Bearer {token}"))
+        };
+
         let token = self.load_user_token()?;
-        let resp = self
-            .http
-            .get(vehicle_data_url(&self.config.vin))
-            .bearer_auth(&token.access_token)
-            .send()?;
-
-        if !resp.status().is_success() {
-            error!("Error: {}", resp.status());
-        }
-
-        let resp = if resp.status() == StatusCode::UNAUTHORIZED {
-            let token = self.refresh_token()?;
-            self.http
-                .get(vehicle_data_url(&self.config.vin))
-                .bearer_auth(&token.access_token)
-                .send()?
-        } else if resp.status() == StatusCode::REQUEST_TIMEOUT {
-            Err(TeslaError::CarSleeping(resp.status().to_string()))?
-        } else {
-            resp
+        let mut resp = match make_req(&token.access_token).call() {
+            Ok(r) => r,
+            Err(ureq::Error::StatusCode(401)) => {
+                let token = self.refresh_token()?;
+                make_req(&token.access_token).call()?
+            }
+            Err(ureq::Error::StatusCode(408)) => {
+                return Err(TeslaError::CarSleeping("408".into()));
+            }
+            Err(e) => {
+                if let ureq::Error::StatusCode(code) = &e {
+                    error!("Error: {code}");
+                }
+                return Err(e.into());
+            }
         };
 
         let vehicle_data = resp
-            .error_for_status()?
-            .json::<VehicleDataResponseEnvelope>()?
+            .body_mut()
+            .read_json::<VehicleDataResponseEnvelope>()?
             .response;
 
         validate_charging_state(&vehicle_data.charge_state.charging_state);
@@ -411,32 +439,35 @@ impl TeslaVehicle {
     }
 
     fn send_command(&self, command: &str, body: serde_json::Value) -> TeslaResult<CommandResponse> {
+        let url = get_command_url(command, &self.config.vin);
+        let body_str = body.to_string();
+        let agent = self.http.clone();
         let make_req = |token: &str| {
-            self.http
-                .post(get_command_url(command, &self.config.vin))
-                .bearer_auth(token)
-                .json(&body)
+            agent
+                .post(&url)
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
         };
 
         let token = self.load_user_token()?;
-        let resp = make_req(&token.access_token).send()?;
-
-        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let token = self.refresh_token()?;
-            make_req(&token.access_token).send()?
-        } else {
-            resp
+        let resp = match make_req(&token.access_token).send(&body_str) {
+            Ok(r) => r,
+            Err(ureq::Error::StatusCode(401)) => {
+                let token = self.refresh_token()?;
+                make_req(&token.access_token).send(&body_str)?
+            }
+            Err(e) => return Err(e.into()),
         };
 
-        let body = resp.error_for_status()?.text()?;
-        trace!("Response: {body}");
+        let resp_body = resp.into_body().read_to_string()?;
+        trace!("Response: {resp_body}");
 
         #[derive(Deserialize, Debug)]
         struct CommandResponseEnvelope {
             pub response: CommandResponse,
         }
 
-        let envelope: CommandResponseEnvelope = serde_json::from_str(&body)?;
+        let envelope: CommandResponseEnvelope = serde_json::from_str(&resp_body)?;
         Ok(envelope.response)
     }
 
@@ -449,19 +480,18 @@ impl TeslaVehicle {
 
         let resp = self
             .http
-            .post(format!("{AUTH_BASE}/oauth2/v3/token"))
-            .form(&[
+            .post(&format!("{AUTH_BASE}/oauth2/v3/token"))
+            .send_form([
                 ("grant_type", "authorization_code"),
-                ("client_id", &self.config.client_id),
-                ("client_secret", &self.config.client_secret),
+                ("client_id", self.config.client_id.as_str()),
+                ("client_secret", self.config.client_secret.as_str()),
                 ("code", code),
                 ("code_verifier", verifier),
                 ("redirect_uri", REDIRECT_URI),
                 ("audience", AUDIENCE),
-            ])
-            .send()?
-            .error_for_status()?
-            .json::<Resp>()?;
+            ])?
+            .into_body()
+            .read_json::<Resp>()?;
 
         Ok(UserToken {
             access_token: resp.access_token,
@@ -498,15 +528,14 @@ impl TeslaVehicle {
 
         let resp = self
             .http
-            .post(format!("{AUTH_BASE}/oauth2/v3/token"))
-            .form(&[
+            .post(&format!("{AUTH_BASE}/oauth2/v3/token"))
+            .send_form([
                 ("grant_type", "refresh_token"),
-                ("client_id", &self.config.client_id),
+                ("client_id", self.config.client_id.as_str()),
                 ("refresh_token", refresh_token),
-            ])
-            .send()?
-            .error_for_status()?
-            .json::<Resp>()?;
+            ])?
+            .into_body()
+            .read_json::<Resp>()?;
 
         let token = UserToken {
             access_token: resp.access_token,
