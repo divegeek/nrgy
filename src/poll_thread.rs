@@ -42,12 +42,10 @@ impl<T: Pollable> PollThread<T> {
         PollGuard(self.state.lock().unwrap())
     }
 
-    #[expect(dead_code)]
     pub fn interval(&self) -> Duration {
         self.state.lock().unwrap().poll_interval
     }
 
-    #[expect(dead_code)]
     pub fn set_interval(&self, interval: Duration) {
         self.state.lock().unwrap().poll_interval = interval;
     }

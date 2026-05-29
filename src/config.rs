@@ -14,6 +14,7 @@ pub struct TeslaConfig {
     pub client_id: String,
     pub client_secret: String,
     pub vin: String,
+    pub private_key: String,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
 }

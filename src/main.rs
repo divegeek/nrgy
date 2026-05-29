@@ -11,7 +11,7 @@ use crate::{
     config::SolarEdgeModbusConfig,
     open_evse::{EvseError, OpenEvse},
     poll_thread::PollThread,
-    tesla::{TeslaError, TeslaVehicle},
+    tesla::{DEFAULT_POLL_INTERVAL, TeslaError, TeslaVehicle, VERY_SLOW_POLL_INTERVAL},
 };
 
 mod config;
@@ -21,7 +21,7 @@ mod rmp;
 mod tesla;
 mod units;
 
-const NORMAL_POLL_INTERVAL: u64 = 30;
+const NORMAL_POLL_INTERVAL: u64 = 15;
 const MIN_CHARGE_AMPS: u8 = 5;
 const MIN_EVSE_CHARGE_AMPS: u8 = 10;
 const MAX_CHARGE_AMPS: u8 = 48;
@@ -44,7 +44,7 @@ type NrgyResult<T> = std::result::Result<T, NrgyError>;
 
 fn main() -> Result<()> {
     env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Trace)
         .filter_module("ureq", log::LevelFilter::Warn)
         .filter_module("rustls", log::LevelFilter::Warn)
         .format(|buf, record| {
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
         .init();
 
     let config = config::load().expect("Failed to load config");
-    let vehicle = TeslaVehicle::new(config.tesla);
+    let vehicle = TeslaVehicle::new(config.tesla)?;
     let mut open_evse = OpenEvse::new(config.open_evse);
     let mut solar_meter = create_modbus_client(&config.solaredge_modbus)?;
 
@@ -86,6 +86,7 @@ fn main() -> Result<()> {
                 error!("Error {e}")
             }
         }
+
         sleep(Duration::from_secs(poll_interval));
     }
 }
@@ -110,8 +111,22 @@ fn poll(
     solar_meter: &mut MeterClient,
 ) -> NrgyResult<()> {
     if !open_evse.plugged_in()? {
-        trace!("Not plugged in");
+        trace!("Not plugged in; switching to slow vehicle polling.");
+        if vehicle.interval() == DEFAULT_POLL_INTERVAL {
+            vehicle.set_interval(VERY_SLOW_POLL_INTERVAL);
+        }
         return Ok(());
+    }
+
+    let now = Zoned::now();
+    if now.hour() > 22 || now.hour() < 8 {
+        if vehicle.interval() == DEFAULT_POLL_INTERVAL {
+            info!("Nighttime; switching to slow vehicle polling");
+            vehicle.set_interval(VERY_SLOW_POLL_INTERVAL);
+        }
+    } else if vehicle.interval() == VERY_SLOW_POLL_INTERVAL {
+        info!("Switching to normal vehicle polling");
+        vehicle.set_interval(DEFAULT_POLL_INTERVAL)
     }
 
     if vehicle.lock().is_full() {
@@ -123,7 +138,7 @@ fn poll(
     let (charging_amps, _) = open_evse.charging_current_and_voltage()?;
     let (grid_export, voltage) = solar_meter.grid_power_and_voltage()?;
     let charging = charging_amps > 0.0;
-    debug!("Vehicle SoC {soc} Charging {charging_amps} Grid {grid_export}");
+    debug!("Vehicle SoC {soc} Charging {charging_amps:.1} Grid {grid_export:.1}");
 
     let charge_amps = if soc < URGENT_CHARGE_THRESHOLD {
         if !charging {
@@ -142,17 +157,9 @@ fn poll(
             0
         }
     } else {
-        let now = Zoned::now();
-        if now.hour() > 20 || now.hour() < 8 {
-            trace!("It's dark, assuming no excess solar, waiting until morning");
-            return Ok(());
-        }
-
         let excess_amps = excess_amps(charging_amps, grid_export, voltage)?;
         if excess_amps > 0 {
-            info!("Excess solar, enabling charging with {excess_amps}")
-        } else {
-            info!("No excess solar.")
+            info!("Enabling charging with {excess_amps}")
         }
         excess_amps
     };
@@ -162,8 +169,9 @@ fn poll(
         let mut vehicle = vehicle.lock();
 
         open_evse.set_current_capacity(charge_amps)?;
-        open_evse.enable()?;
-        vehicle.set_charging_amps(MAX_CHARGE_AMPS)?;
+        if vehicle.charging_amps() < MAX_CHARGE_AMPS as u16 {
+            vehicle.set_charging_amps(MAX_CHARGE_AMPS)?;
+        }
         vehicle.charge_start()?;
     } else if charge_amps >= MIN_CHARGE_AMPS {
         trace!("Setting charging amps to {charge_amps} using Tesla");
@@ -195,17 +203,22 @@ fn excess_amps(charging_amps: f64, grid_export: f64, voltage: f64) -> NrgyResult
         // can't.  Instead, we just drop the charge rate, first to the OpenEVSE minimum, then to
         // the car minimum, then to zero, to see if that results in non-trivial power going into
         // the grid -- at which point we can trust our excess power calculation.
-        return Ok(if charging_amps > MIN_EVSE_CHARGE_AMPS as f64 {
-            debug!("{grid_export} < {LOW_THRESHOLD}, reducing to {MIN_EVSE_CHARGE_AMPS}");
-            MIN_EVSE_CHARGE_AMPS
-        } else if charging_amps > MIN_CHARGE_AMPS as f64 {
-            debug!("{grid_export} <  {LOW_THRESHOLD}, reducing to {MIN_CHARGE_AMPS}");
+        return Ok(if charging_amps as u8 > MIN_EVSE_CHARGE_AMPS {
+            let new_amps = ((charging_amps / 2.0) as u8).max(MIN_EVSE_CHARGE_AMPS);
+            debug!(
+                "{grid_export:.1} < {LOW_THRESHOLD}, reducing from {charging_amps} to {new_amps}"
+            );
+            new_amps
+        } else if charging_amps as u8 > MIN_CHARGE_AMPS {
+            debug!(
+                "{grid_export:.1} <  {LOW_THRESHOLD}, reducing from {charging_amps} to {MIN_CHARGE_AMPS}"
+            );
             MIN_CHARGE_AMPS
-        } else if charging_amps > 0.0 {
-            debug!("{grid_export} <  {LOW_THRESHOLD}, reducing to 0");
+        } else if charging_amps as u8 > 0 {
+            debug!("{grid_export:.1} <  {LOW_THRESHOLD}, reducing from {charging_amps} to 0");
             0
         } else {
-            debug!("{grid_export} < {LOW_THRESHOLD}, staying at 0");
+            debug!("{grid_export:.1} < {LOW_THRESHOLD}, staying at 0");
             0
         });
     }
@@ -216,12 +229,12 @@ fn excess_amps(charging_amps: f64, grid_export: f64, voltage: f64) -> NrgyResult
     }
 
     // grid_export is above HIGH_THRESHOLD, so we think we may have some additional power to
-    // charge with.  However, to "creep" to the right target, we only adjust halfway to it, then
-    // we clamp to within the feasible range.
+    // charge with.  However, to "creep" to the right target, we only adjust one third of the way
+    // to it, then we clamp to within the feasible range.
     let excess_power = grid_export + car_power - LOW_THRESHOLD;
     let excess_amps = excess_power / voltage;
     let new_amps =
-        ((charging_amps + (excess_amps - charging_amps) / 2.0) as u8).clamp(0, MAX_CHARGE_AMPS);
+        ((charging_amps + (excess_amps - charging_amps) / 3.0) as u8).clamp(0, MAX_CHARGE_AMPS);
 
     // Adjusting the rate is free and easy as long as we're making the adjustment on the OpenEVSE.
     // But we want to be more careful if the new rate is below the OpenEVSE minimum threshold,
@@ -239,8 +252,8 @@ fn excess_amps(charging_amps: f64, grid_export: f64, voltage: f64) -> NrgyResult
     };
 
     debug!(
-        "Excess power {excess_power} -> excess amps {excess_amps} -> adjust from \
-    {charging_amps} to new amps {new_amps} -> target {target_amps}",
+        "Excess power {excess_power:.1} -> excess amps {excess_amps:.1} -> adjust from \
+    {charging_amps:.1} to new amps {new_amps} -> target {target_amps}",
     );
 
     Ok(target_amps)
