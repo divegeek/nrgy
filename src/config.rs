@@ -7,6 +7,13 @@ pub struct Config {
     pub tesla: TeslaConfig,
     pub open_evse: OpenEvseConfig,
     pub solaredge_modbus: SolarEdgeModbusConfig,
+    pub photon: Option<PhotonConfig>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PhotonConfig {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Deserialize, Debug, Default)]

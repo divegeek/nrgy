@@ -1,6 +1,5 @@
 use std::{
-    ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -9,70 +8,43 @@ use log::error;
 
 use crate::NrgyResult;
 
-pub trait Pollable: Send + 'static {
+pub trait Pollable: Send + Sync + 'static {
     fn name(&self) -> &'static str;
-    fn init(&mut self) -> NrgyResult<()>;
-    fn poll(&mut self) -> NrgyResult<()>;
+    fn init(&self) -> NrgyResult<()>;
+    fn poll(&self) -> NrgyResult<()>;
     fn default_interval(&self) -> Duration;
 }
 
-pub struct PollThread<T: Pollable> {
-    state: Arc<Mutex<Inner<T>>>,
+pub struct PollThread {
+    poll_interval_nanos: Arc<AtomicU64>,
     _handle: JoinHandle<()>,
 }
 
-pub struct Inner<T> {
-    poll_interval: Duration,
-    task: T,
-}
-
-impl<T: Pollable> PollThread<T> {
-    pub fn start(mut task: T) -> NrgyResult<Self> {
+impl PollThread {
+    pub fn start<T: Pollable>(task: Arc<T>) -> NrgyResult<Self> {
+        let (default_interval, name) = (task.default_interval(), task.name());
         task.init()?;
-        let state = Arc::new(Mutex::new(Inner {
-            poll_interval: task.default_interval(),
-            task,
-        }));
-        let thread_state = state.clone();
-        let _handle = thread::spawn(move || poll_loop(thread_state));
-        Ok(Self { state, _handle })
-    }
 
-    pub fn lock(&'_ self) -> PollGuard<'_, T> {
-        PollGuard(self.state.lock().unwrap())
+        let poll_interval_nanos = Arc::new(AtomicU64::new(default_interval.as_nanos() as u64));
+        let thread_task = task.clone();
+        let thread_interval = poll_interval_nanos.clone();
+
+        let _handle = thread::spawn(move || loop {
+            let nanos = thread_interval.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_nanos(nanos));
+            if let Err(e) = thread_task.poll() {
+                error!("Poll {name} error: {e}");
+            }
+        });
+
+        Ok(Self { poll_interval_nanos, _handle })
     }
 
     pub fn interval(&self) -> Duration {
-        self.state.lock().unwrap().poll_interval
+        Duration::from_nanos(self.poll_interval_nanos.load(Ordering::Relaxed))
     }
 
     pub fn set_interval(&self, interval: Duration) {
-        self.state.lock().unwrap().poll_interval = interval;
-    }
-}
-
-pub struct PollGuard<'a, T>(MutexGuard<'a, Inner<T>>);
-
-impl<T> Deref for PollGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0.task
-    }
-}
-
-impl<T> DerefMut for PollGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0.task
-    }
-}
-
-fn poll_loop<T: Pollable>(thread_state: Arc<Mutex<Inner<T>>>) -> ! {
-    let name = thread_state.lock().unwrap().task.name();
-    loop {
-        let interval = thread_state.lock().unwrap().poll_interval;
-        thread::sleep(interval);
-        if let Err(e) = thread_state.lock().unwrap().task.poll() {
-            error!("Poll {} error: {e}", name)
-        }
+        self.poll_interval_nanos.store(interval.as_nanos() as u64, Ordering::Relaxed);
     }
 }

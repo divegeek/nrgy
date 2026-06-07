@@ -1,12 +1,10 @@
-use std::time::Duration;
-
 use base64::{Engine, engine::general_purpose::STANDARD};
 use jiff::civil::DateTime;
 use log::trace;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{NrgyResult, config::OpenEvseConfig, poll_thread::Pollable};
+use crate::config::OpenEvseConfig;
 
 #[derive(Error, Debug)]
 pub enum EvseError {
@@ -130,30 +128,6 @@ pub struct OpenEvse {
     pub charging_voltage: f64,
 }
 
-impl Pollable for OpenEvse {
-    fn name(&self) -> &'static str {
-        "OpenEVSE"
-    }
-
-    fn init(&mut self) -> NrgyResult<()> {
-        self.set_timer(self.timer)?;
-        self.poll()?;
-        Ok(())
-    }
-
-    fn poll(&mut self) -> crate::NrgyResult<()> {
-        self.state()?;
-        self.charging_current_and_voltage()?;
-        self.current_capacity()?;
-        self.current_capacity_range()?;
-        self.flags()?;
-        Ok(())
-    }
-
-    fn default_interval(&self) -> Duration {
-        Duration::from_secs(5)
-    }
-}
 
 #[expect(dead_code)]
 impl OpenEvse {

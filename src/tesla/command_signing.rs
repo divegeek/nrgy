@@ -335,6 +335,57 @@ impl CommandSigner {
         Ok(())
     }
 
+    /// Decrypt an AES-128-GCM encrypted response from the vehicle (for BLE transport).
+    ///
+    /// `domain` must match the domain used when sending the command (the car uses it in the AAD).
+    pub fn decrypt(&self, message: &RoutableMessage, domain: u8) -> SigningResult<Vec<u8>> {
+        let session_key = self.session_key()?;
+
+        let gcm_data = match &message.sub_sig_data {
+            Some(SubSigData::SignatureData(sd)) => match &sd.sig_type {
+                Some(SigType::AesGcmPersonalizedData(d)) => d,
+                _ => return Err(SigningError::NoPayload),
+            },
+            _ => return Err(SigningError::NoPayload),
+        };
+
+        let ciphertext = match &message.payload {
+            Some(Payload::ProtobufMessageAsBytes(b)) => b,
+            _ => return Err(SigningError::NoPayload),
+        };
+
+        let mut meta = MetadataTlv::new();
+        meta.add(
+            Tag::SignatureType as u8,
+            &[SignatureType::AesGcmPersonalized as u8],
+        )?;
+        meta.add(Tag::Domain as u8, &[domain])?;
+        meta.add(Tag::Personalization as u8, &self.vin)?;
+        meta.add(Tag::Epoch as u8, &gcm_data.epoch)?;
+        meta.add_u32(Tag::ExpiresAt as u8, gcm_data.expires_at)?;
+        meta.add_u32(Tag::Counter as u8, gcm_data.counter)?;
+        if message.flags != 0 {
+            meta.add_u32(Tag::Flags as u8, message.flags)?;
+        }
+        let aad = meta.sha256_checksum(&[]);
+
+        let mut ct_and_tag = ciphertext.clone();
+        ct_and_tag.extend_from_slice(&gcm_data.tag);
+
+        let nonce = aes_gcm::Nonce::from_slice(&gcm_data.nonce);
+        let cipher =
+            Aes128Gcm::new_from_slice(&session_key).map_err(|_| SigningError::EncryptionError)?;
+        cipher
+            .decrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: &ct_and_tag,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| SigningError::EncryptionError)
+    }
+
     /// Add HMAC authentication tag to message (for HTTP proxy / cloud transport).
     ///
     /// The payload is NOT encrypted; the HMAC authenticates both metadata and payload.
