@@ -1,4 +1,9 @@
-use std::{io::Write as _, sync::Arc, thread::sleep, time::Duration};
+use std::{
+    io::Write as _,
+    sync::{Arc, Mutex},
+    thread::sleep,
+    time::Duration,
+};
 
 use anyhow::Result;
 use jiff::Zoned;
@@ -11,6 +16,7 @@ use crate::{
     config::SolarEdgeModbusConfig,
     open_evse::{EvseError, OpenEvse},
     poll_thread::PollThread,
+    solar_edge::{SolarEdge, SolarEdgeError},
     tesla::{DEFAULT_POLL_INTERVAL, TeslaError, TeslaVehicle, VERY_SLOW_POLL_INTERVAL},
 };
 
@@ -18,19 +24,23 @@ mod config;
 mod open_evse;
 mod poll_thread;
 mod rmp;
+mod solar_edge;
 mod tesla;
 mod units;
 
-const NORMAL_POLL_INTERVAL: u64 = 15;
+const NORMAL_POLL_INTERVAL: u64 = 10;
 const MIN_CHARGE_AMPS: u8 = 1;
 const MAX_CHARGE_AMPS: u8 = 48;
 const URGENT_CHARGE_THRESHOLD: u8 = 40;
 const SHOULD_CHARGE_THRESHOLD: u8 = 60;
+const MIN_BATTERY_SOC: u8 = 90;
 
 #[derive(Error, Debug)]
 enum NrgyError {
     #[error("Tesla error: {0}")]
     TeslaError(#[from] TeslaError),
+    #[error("SolarEdge error: {0}")]
+    SolarEdgeError(#[from] SolarEdgeError),
     #[error("Time error: {0}")]
     TimeError(#[from] jiff::Error),
     #[error("OpenEVSE error: {0}")]
@@ -60,7 +70,21 @@ fn main() -> Result<()> {
     let config = config::load().expect("Failed to load config");
     let vehicle = TeslaVehicle::new(config.tesla, config.photon.clone())?;
     let mut open_evse = OpenEvse::new(config.open_evse);
-    let mut solar_meter = create_modbus_client(&config.solaredge_modbus)?;
+    let solar_edge = Arc::new(Mutex::new(SolarEdge::new(config.solar_edge)));
+    let mut solar_meter = MeterClient::new(
+        &config.solaredge_modbus.host,
+        config.solaredge_modbus.port,
+        config.solaredge_modbus.device_id,
+        match config.solaredge_modbus.slot {
+            1 => SlotNumber::One,
+            2 => SlotNumber::Two,
+            3 => SlotNumber::Three,
+            _ => panic!(
+                "Invalid SolarEdge modbus meter slot {}",
+                config.solaredge_modbus.slot
+            ),
+        },
+    )?;
 
     if std::env::args().any(|a| a == "--auth") {
         vehicle.authenticate()?;
@@ -68,10 +92,19 @@ fn main() -> Result<()> {
     }
 
     let vehicle_thread = PollThread::start(vehicle.clone())?;
+    let _solar_thread = PollThread::start(solar_edge.clone())?;
 
     let poll_interval = NORMAL_POLL_INTERVAL;
     loop {
-        match poll(&vehicle, &vehicle_thread, &mut open_evse, &mut solar_meter) {
+        vehicle.ensure_ble_bridge();
+
+        match poll(
+            &vehicle,
+            &vehicle_thread,
+            &mut open_evse,
+            &mut solar_meter,
+            &solar_edge,
+        ) {
             Ok(()) => (),
             Err(NrgyError::TeslaError(TeslaError::UreqError(e))) => {
                 error!("Tesla request error {e}");
@@ -108,28 +141,24 @@ fn poll(
     vehicle_thread: &PollThread,
     open_evse: &mut OpenEvse,
     solar_meter: &mut MeterClient,
+    solar_edge: &Arc<Mutex<SolarEdge>>,
 ) -> NrgyResult<()> {
     if !open_evse.plugged_in()? {
-        trace!("Not plugged in; switching to slow vehicle polling.");
-        if vehicle_thread.interval() == DEFAULT_POLL_INTERVAL {
-            vehicle_thread.set_interval(VERY_SLOW_POLL_INTERVAL);
-        }
+        vehicle_thread.set_interval(VERY_SLOW_POLL_INTERVAL);
+        info!("Not plugged in");
         return Ok(());
+    } else {
+        vehicle_thread.set_interval(DEFAULT_POLL_INTERVAL);
     }
 
     let now = Zoned::now();
     if now.hour() > 22 || now.hour() < 8 {
-        if vehicle_thread.interval() == DEFAULT_POLL_INTERVAL {
-            info!("Nighttime; switching to slow vehicle polling");
-            vehicle_thread.set_interval(VERY_SLOW_POLL_INTERVAL);
-        }
-    } else if vehicle_thread.interval() == VERY_SLOW_POLL_INTERVAL {
-        info!("Switching to normal vehicle polling");
-        vehicle_thread.set_interval(DEFAULT_POLL_INTERVAL)
+        vehicle_thread.set_interval(VERY_SLOW_POLL_INTERVAL);
     }
 
     if vehicle.is_full() {
-        trace!("Vehicle is full");
+        vehicle_thread.set_interval(VERY_SLOW_POLL_INTERVAL);
+        info!("Vehicle is full");
         return Ok(());
     }
 
@@ -144,7 +173,7 @@ fn poll(
             warn!("SoC {soc} below {URGENT_CHARGE_THRESHOLD}.  Urgently need to charge.")
         };
         MAX_CHARGE_AMPS
-    } else if soc < SHOULD_CHARGE_THRESHOLD {
+    } else if soc < SHOULD_CHARGE_THRESHOLD && soc >= 60 {
         let now = Zoned::now();
         if now.hour() < 18 || now.hour() >= 22 {
             if !charging {
@@ -155,11 +184,18 @@ fn poll(
             0
         }
     } else {
-        let excess_amps = excess_amps(charging_amps, grid_export, voltage)?;
-        if excess_amps > 0 {
-            info!("Enabling charging with {excess_amps}")
+        let solar_edge = solar_edge.lock().unwrap();
+        let soc = solar_edge.power_flow.battery_soc.unwrap_or(0);
+        if soc < MIN_BATTERY_SOC {
+            debug!("House battery {soc}");
+            0
+        } else {
+            let excess_amps = excess_amps(charging_amps, grid_export, voltage)?;
+            if excess_amps > 0 {
+                info!("Enabling charging with {excess_amps}")
+            }
+            excess_amps
         }
-        excess_amps
     };
 
     if charge_amps >= MIN_CHARGE_AMPS {
@@ -173,8 +209,8 @@ fn poll(
     Ok(())
 }
 
-const HIGH_THRESHOLD: f64 = 1000.0;
-const LOW_THRESHOLD: f64 = 500.0;
+const HIGH_THRESHOLD: f64 = 500.0;
+const LOW_THRESHOLD: f64 = 250.0;
 
 fn excess_amps(charging_amps: f64, grid_export: f64, voltage: f64) -> NrgyResult<u8> {
     let car_power = charging_amps * voltage;
@@ -182,7 +218,9 @@ fn excess_amps(charging_amps: f64, grid_export: f64, voltage: f64) -> NrgyResult
     if grid_export < LOW_THRESHOLD {
         return Ok(if charging_amps as u8 > MIN_CHARGE_AMPS {
             let new_amps = ((charging_amps / 2.0) as u8).max(MIN_CHARGE_AMPS);
-            debug!("{grid_export:.1} < {LOW_THRESHOLD}, reducing from {charging_amps} to {new_amps}");
+            debug!(
+                "{grid_export:.1} < {LOW_THRESHOLD}, reducing from {charging_amps} to {new_amps}"
+            );
             new_amps
         } else if charging_amps as u8 > 0 {
             debug!("{grid_export:.1} <  {LOW_THRESHOLD}, reducing from {charging_amps} to 0");
@@ -200,7 +238,7 @@ fn excess_amps(charging_amps: f64, grid_export: f64, voltage: f64) -> NrgyResult
     let excess_power = grid_export + car_power - LOW_THRESHOLD;
     let excess_amps = excess_power / voltage;
     let new_amps =
-        ((charging_amps + (excess_amps - charging_amps) / 3.0) as u8).clamp(0, MAX_CHARGE_AMPS);
+        ((charging_amps + (excess_amps - charging_amps) / 2.0) as u8).clamp(0, MAX_CHARGE_AMPS);
 
     let target_amps = if new_amps >= MIN_CHARGE_AMPS {
         new_amps

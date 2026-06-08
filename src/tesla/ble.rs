@@ -3,19 +3,15 @@ use std::net::{SocketAddr, TcpStream};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use log::{debug, warn};
 use prost::Message;
 
 use super::TeslaResult;
 use super::proto::universal_message::RoutableMessage;
 
-/// A persistent write connection to the Photon BLE bridge.
-///
-/// A background reader thread blocks indefinitely on the TCP socket. For each
-/// message it calls `on_message(Some(msg))`; on close it calls `on_message(None)`
-/// and exits. The caller owns the processing logic — this struct is just the
-/// transport.
 pub struct BleBridge {
     write_stream: TcpStream,
+    failed: bool,
     _reader: JoinHandle<()>,
 }
 
@@ -39,21 +35,45 @@ impl BleBridge {
         let mut read_stream = stream.try_clone()?;
         let write_stream = stream;
 
-        let reader = std::thread::spawn(move || loop {
-            match recv_raw(&mut read_stream) {
-                Ok(msg) => on_message(Some(msg)),
-                Err(_) => { on_message(None); break; }
+        let reader = std::thread::spawn(move || {
+            loop {
+                match recv_raw(&mut read_stream) {
+                    Ok(msg) => on_message(Some(msg)),
+                    Err(_) => {
+                        on_message(None);
+                        break;
+                    }
+                }
             }
         });
 
-        Ok(Self { write_stream, _reader: reader })
+        Ok(Self {
+            write_stream,
+            failed: false,
+            _reader: reader,
+        })
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     pub fn send(&mut self, msg: &RoutableMessage) -> TeslaResult<()> {
         let bytes = msg.encode_to_vec();
-        self.write_stream.write_all(&(bytes.len() as u16).to_be_bytes())?;
-        self.write_stream.write_all(&bytes)?;
-        Ok(())
+        let result = self
+            .write_stream
+            .write_all(&(bytes.len() as u16).to_be_bytes())
+            .and_then(|_| self.write_stream.write_all(&bytes));
+        if let Err(ref e) = result {
+            debug!("BLE send failed ({e}), marking bridge as failed");
+            self.failed = true;
+        }
+        Ok(result?)
+    }
+
+    pub fn set_failed(&mut self) {
+        warn!("TCP connection failed");
+        self.failed = true;
     }
 }
 

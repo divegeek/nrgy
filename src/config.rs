@@ -5,6 +5,7 @@ use std::path::PathBuf;
 #[derive(Deserialize)]
 pub struct Config {
     pub tesla: TeslaConfig,
+    pub solar_edge: SolarEdgeConfig,
     pub open_evse: OpenEvseConfig,
     pub solaredge_modbus: SolarEdgeModbusConfig,
     pub photon: Option<PhotonConfig>,
@@ -24,6 +25,12 @@ pub struct TeslaConfig {
     pub private_key: String,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SolarEdgeConfig {
+    pub site_id: u32,
+    pub api_key: String,
 }
 
 #[derive(Debug, Deserialize, Default)]

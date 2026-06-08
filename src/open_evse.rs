@@ -128,7 +128,6 @@ pub struct OpenEvse {
     pub charging_voltage: f64,
 }
 
-
 #[expect(dead_code)]
 impl OpenEvse {
     pub fn new(config: OpenEvseConfig) -> Self {
@@ -172,7 +171,7 @@ impl OpenEvse {
     }
 
     pub fn plugged_in(&mut self) -> EvseResult<bool> {
-        match self.state {
+        match self.state()? {
             EvseState::Connected | EvseState::Charging => Ok(true),
             EvseState::NotConnected => Ok(false),
             _ => {

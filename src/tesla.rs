@@ -10,7 +10,6 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use function_name::named;
-use ignorable::PartialEq;
 use jiff::{Timestamp, Zoned};
 use log::{debug, error, info, trace, warn};
 use pretty_assertions::Comparison;
@@ -25,6 +24,7 @@ use crate::{
     config::{PhotonConfig, TeslaConfig},
     poll_thread::Pollable,
     tesla::{
+        ble::BleBridge,
         command_signing::{CommandSigner, SigningError},
         proto::{
             car_server::{
@@ -40,10 +40,9 @@ use crate::{
             },
             vcsec::{
                 FromVcsecMessage, InformationRequest, InformationRequestType,
-                OperationStatusE as VcsecOperationStatusE, RkeActionE,
-                UnsignedMessage, from_vcsec_message::SubMessage as FromVcsecSubMessage,
+                OperationStatusE as VcsecOperationStatusE, RkeActionE, UnsignedMessage,
+                VehicleSleepStatusE, from_vcsec_message::SubMessage as FromVcsecSubMessage,
                 unsigned_message::SubMessage as VcsecSubMessage,
-                VehicleSleepStatusE,
             },
         },
     },
@@ -54,7 +53,7 @@ mod command_signing;
 mod proto;
 
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(300);
-pub const VERY_SLOW_POLL_INTERVAL: Duration = Duration::from_hours(2);
+pub const VERY_SLOW_POLL_INTERVAL: Duration = Duration::from_hours(1);
 
 const AUTH_BASE: &str = "https://fleet-auth.prd.vn.cloud.tesla.com";
 const COMMAND_API_BASE: &str = "https://fleet-api.prd.na.vn.cloud.tesla.com";
@@ -103,13 +102,16 @@ pub struct VehicleDataResponseEnvelope {
     response: VehicleData,
 }
 
-#[derive(Deserialize, Debug, Default, PartialEq)]
+#[expect(unused)]
+#[derive(Deserialize, Debug, Default)]
 pub struct VehicleData {
     pub charge_state: VehicleChargeState,
+    pub drive_state: VehicleDriveState,
     pub vehicle_state: VehicleState,
 }
 
-#[derive(Deserialize, Debug, Default, PartialEq)]
+#[expect(unused)]
+#[derive(Deserialize, Debug, Default)]
 pub struct VehicleChargeState {
     pub battery_level: u8,
     pub charge_amps: u16,
@@ -124,7 +126,14 @@ pub struct VehicleChargeState {
     pub minutes_to_full_charge: u16,
 }
 
-#[derive(Deserialize, Debug, Default, PartialEq)]
+#[expect(unused)]
+#[derive(Deserialize, Debug, Default)]
+pub struct VehicleDriveState {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+#[derive(Deserialize, Debug, Default)]
 pub struct VehicleState {
     pub homelink_nearby: bool,
 }
@@ -154,13 +163,19 @@ struct CloudState {
 
 /// State touched exclusively by the BLE reader thread and BLE commands.
 struct BleState {
-    bridge: Option<ble::BleBridge>,
+    bridge: Option<BleBridge>,
     infotainment_signer: CommandSigner,
     vcsec_signer: CommandSigner,
     sleep_status: i32,
     /// A session_info_request has been sent but the response not yet received.
     infotainment_session_pending: bool,
     vcsec_session_pending: bool,
+}
+
+impl BleState {
+    pub fn bridge_good(&self) -> bool {
+        self.bridge.as_ref().is_some_and(|b| !b.failed())
+    }
 }
 
 /// BLE state + condvar, shared with the reader thread via `Arc`.
@@ -195,7 +210,9 @@ pub struct TeslaVehicle {
 }
 
 impl Pollable for TeslaVehicle {
-    fn name(&self) -> &'static str { "TeslaVehicle" }
+    fn name(&self) -> &'static str {
+        "TeslaVehicle"
+    }
 
     fn init(&self) -> crate::NrgyResult<()> {
         self.ensure_ble_bridge();
@@ -220,12 +237,13 @@ impl Pollable for TeslaVehicle {
     }
 
     fn poll(&self) -> crate::NrgyResult<()> {
-        self.ensure_ble_bridge();
         self.update_state()?;
         Ok(())
     }
 
-    fn default_interval(&self) -> Duration { DEFAULT_POLL_INTERVAL }
+    fn default_interval(&self) -> Duration {
+        DEFAULT_POLL_INTERVAL
+    }
 }
 
 #[expect(dead_code)]
@@ -262,17 +280,21 @@ impl TeslaVehicle {
     /// `timeout` expires.  Safe to call while holding the cloud lock.
     pub fn wait_for_wakeup(&self, timeout: Duration) -> bool {
         let guard = self.ble.state.lock().unwrap();
-        let (_guard, timed_out) = self.ble.changed.wait_timeout_while(
-            guard, timeout,
-            |s| s.sleep_status != VehicleSleepStatusE::VehicleSleepStatusAwake as i32,
-        ).unwrap();
+        let (_guard, timed_out) = self
+            .ble
+            .changed
+            .wait_timeout_while(guard, timeout, |s| {
+                s.sleep_status != VehicleSleepStatusE::VehicleSleepStatusAwake as i32
+            })
+            .unwrap();
         !timed_out.timed_out()
     }
 
     // ── Vehicle state accessors ───────────────────────────────────────────────
 
     pub fn is_home(&self) -> bool {
-        self.cloud.lock().unwrap().data.vehicle_state.homelink_nearby
+        let cloud = self.cloud.lock().unwrap();
+        cloud.data.vehicle_state.homelink_nearby
     }
 
     pub fn plugged_in(&self) -> bool {
@@ -284,17 +306,13 @@ impl TeslaVehicle {
     }
 
     pub fn is_charging(&self) -> bool {
-        matches!(
-            self.cloud.lock().unwrap().data.charge_state.charging_state.as_str(),
-            "Charging"
-        )
+        let cloud = self.cloud.lock().unwrap();
+        matches!(cloud.data.charge_state.charging_state.as_str(), "Charging")
     }
 
     pub fn is_full(&self) -> bool {
-        matches!(
-            self.cloud.lock().unwrap().data.charge_state.charging_state.as_str(),
-            "Complete"
-        )
+        let cloud = self.cloud.lock().unwrap();
+        matches!(cloud.data.charge_state.charging_state.as_str(), "Complete")
     }
 
     pub fn charging_amps(&self) -> u16 {
@@ -302,7 +320,8 @@ impl TeslaVehicle {
     }
 
     pub fn charge_limit(&self) -> u8 {
-        self.cloud.lock().unwrap().data.charge_state.charge_limit_soc
+        let cloud = self.cloud.lock().unwrap();
+        cloud.data.charge_state.charge_limit_soc
     }
 
     // ── Charging commands ─────────────────────────────────────────────────────
@@ -324,7 +343,10 @@ impl TeslaVehicle {
                 "complete" | "is_charging" | "requested" => Ok(()),
                 "disconnected" => Err(TeslaError::ChargerDisconnected)?,
                 "no_power" => Err(TeslaError::ChargerWithoutPower)?,
-                _ => Err(TeslaError::UnknownCommandResponse(function_name!(), resp.reason))?,
+                _ => Err(TeslaError::UnknownCommandResponse(
+                    function_name!(),
+                    resp.reason,
+                ))?,
             }
         } else {
             Ok(())
@@ -346,7 +368,10 @@ impl TeslaVehicle {
         if !resp.result {
             match resp.reason.as_str() {
                 "not_charging" => Ok(()),
-                _ => Err(TeslaError::UnknownCommandResponse(function_name!(), resp.reason))?,
+                _ => Err(TeslaError::UnknownCommandResponse(
+                    function_name!(),
+                    resp.reason,
+                ))?,
             }
         } else {
             Ok(())
@@ -355,22 +380,30 @@ impl TeslaVehicle {
 
     #[named]
     pub fn set_charging_amps(&self, amps: u8) -> TeslaResult<()> {
-        let current_request = self.cloud.lock().unwrap().data.charge_state.charge_current_request;
-        trace!("Got request for {amps} amps, currently {current_request}");
-        if current_request == amps as u16 {
-            debug!("Got request for {amps} amps, already set at {current_request}");
-            return Ok(());
+        if self.photon.is_none() {
+            let cloud = self.cloud.lock().unwrap();
+            let cur_req = cloud.data.charge_state.charge_current_request;
+            trace!("Got request for {amps} amps, currently {cur_req}");
+            if cur_req == amps as u16 {
+                debug!("Got request for {amps} amps, already set at {cur_req}");
+                return Ok(());
+            }
         }
-        info!("Changing car charge amps from {current_request} to {amps}");
+        info!("Changing car charge amps to {amps}");
         let resp = self.send_signed_command(Action {
             action_msg: Some(ActionMsg::VehicleAction(VehicleAction {
                 vehicle_action_msg: Some(VehicleActionMsg::SetChargingAmpsAction(
-                    SetChargingAmpsAction { charging_amps: amps as i32 },
+                    SetChargingAmpsAction {
+                        charging_amps: amps as i32,
+                    },
                 )),
             })),
         })?;
         if !resp.result {
-            Err(TeslaError::UnknownCommandResponse(function_name!(), resp.reason))?
+            Err(TeslaError::UnknownCommandResponse(
+                function_name!(),
+                resp.reason,
+            ))?
         } else {
             Ok(())
         }
@@ -381,14 +414,19 @@ impl TeslaVehicle {
         let resp = self.send_signed_command(Action {
             action_msg: Some(ActionMsg::VehicleAction(VehicleAction {
                 vehicle_action_msg: Some(VehicleActionMsg::ChargingSetLimitAction(
-                    ChargingSetLimitAction { percent: percent as i32 },
+                    ChargingSetLimitAction {
+                        percent: percent as i32,
+                    },
                 )),
             })),
         })?;
         if !resp.result {
             match resp.reason.as_str() {
                 "already_set" => Ok(()),
-                _ => Err(TeslaError::UnknownCommandResponse(function_name!(), resp.reason))?,
+                _ => Err(TeslaError::UnknownCommandResponse(
+                    function_name!(),
+                    resp.reason,
+                ))?,
             }
         } else {
             Ok(())
@@ -400,12 +438,14 @@ impl TeslaVehicle {
     /// Connect the persistent BLE bridge if not already connected.
     /// Proactively sends session_info_requests on fresh connections.
     /// Returns false if the Photon is unreachable.
-    fn ensure_ble_bridge(&self) -> bool {
-        let Some(photon) = self.photon.clone() else { return false };
-        {
-            if self.ble.state.lock().unwrap().bridge.is_some() {
-                return true;
-            }
+    pub fn ensure_ble_bridge(&self) -> bool {
+        let Some(photon) = self.photon.clone() else {
+            return false;
+        };
+        if self.ble.state.lock().unwrap().bridge_good() {
+            return true;
+        } else {
+            debug!("BLE bridge failed, reconnecting");
         }
         let ble = self.ble.clone();
         let on_message = move |msg: Option<RoutableMessage>| {
@@ -415,7 +455,7 @@ impl TeslaVehicle {
                     Some(m) => process_ble_msg(&mut state, m),
                     None => {
                         debug!("BLE bridge closed (car disconnected from BLE)");
-                        state.bridge = None;
+                        state.bridge.as_mut().map(|b| b.set_failed());
                         state.infotainment_signer.invalidate_session();
                         state.vcsec_signer.invalidate_session();
                         state.infotainment_session_pending = false;
@@ -426,15 +466,23 @@ impl TeslaVehicle {
             ble.changed.notify_all();
         };
 
-        match ble::BleBridge::connect(&photon.host, photon.port, Duration::from_secs(3), on_message) {
+        match ble::BleBridge::connect(
+            &photon.host,
+            photon.port,
+            Duration::from_secs(3),
+            on_message,
+        ) {
             Ok(mut bridge) => {
                 let mut state = self.ble.state.lock().unwrap();
                 state.infotainment_signer.invalidate_session();
                 state.vcsec_signer.invalidate_session();
-                let req_i = state.infotainment_signer.session_info_request(Domain::Infotainment);
-                let req_v = state.vcsec_signer.session_info_request(Domain::VehicleSecurity);
+                let req_i = state
+                    .infotainment_signer
+                    .session_info_request(Domain::Infotainment);
+                let req_v = state
+                    .vcsec_signer
+                    .session_info_request(Domain::VehicleSecurity);
                 let _ = bridge.send(&req_i);
-                sleep(Duration::from_millis(100));
                 let _ = bridge.send(&req_v);
                 state.infotainment_session_pending = true;
                 state.vcsec_session_pending = true;
@@ -452,36 +500,62 @@ impl TeslaVehicle {
     /// on the condvar until the reader thread delivers the session_info response.
     fn wait_for_ble_session(&self, vcsec: bool, timeout: Duration) -> TeslaResult<()> {
         let mut state = self.ble.state.lock().unwrap();
-        let already = if vcsec { state.vcsec_signer.has_session() }
-                      else     { state.infotainment_signer.has_session() };
-        if already { return Ok(()); }
+        let already = if vcsec {
+            state.vcsec_signer.has_session()
+        } else {
+            state.infotainment_signer.has_session()
+        };
+        if already {
+            return Ok(());
+        }
         if state.bridge.is_none() {
             return Err(TeslaError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected, "BLE bridge not connected",
+                std::io::ErrorKind::NotConnected,
+                "BLE bridge not connected",
             )));
         }
         // Send a session_info_request only if one is not already in flight.
-        let pending = if vcsec { state.vcsec_session_pending }
-                      else     { state.infotainment_session_pending };
+        let pending = if vcsec {
+            state.vcsec_session_pending
+        } else {
+            state.infotainment_session_pending
+        };
         if !pending {
-            let domain = if vcsec { Domain::VehicleSecurity } else { Domain::Infotainment };
-            let req = if vcsec { state.vcsec_signer.session_info_request(domain) }
-                      else     { state.infotainment_signer.session_info_request(domain) };
+            let domain = if vcsec {
+                Domain::VehicleSecurity
+            } else {
+                Domain::Infotainment
+            };
+            let req = if vcsec {
+                state.vcsec_signer.session_info_request(domain)
+            } else {
+                state.infotainment_signer.session_info_request(domain)
+            };
             if let Some(ref mut b) = state.bridge {
                 let _ = b.send(&req);
-                if vcsec { state.vcsec_session_pending = true; }
-                else     { state.infotainment_session_pending = true; }
+                if vcsec {
+                    state.vcsec_session_pending = true;
+                } else {
+                    state.infotainment_session_pending = true;
+                }
             }
         }
 
-        let (_guard, timed_out) = self.ble.changed.wait_timeout_while(
-            state, timeout,
-            |s| if vcsec { !s.vcsec_signer.has_session() }
-                else     { !s.infotainment_signer.has_session() },
-        ).unwrap();
+        let (_guard, timed_out) = self
+            .ble
+            .changed
+            .wait_timeout_while(state, timeout, |s| {
+                if vcsec {
+                    !s.vcsec_signer.has_session()
+                } else {
+                    !s.infotainment_signer.has_session()
+                }
+            })
+            .unwrap();
         if timed_out.timed_out() {
             return Err(TeslaError::IoError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut, "BLE session establishment timed out",
+                std::io::ErrorKind::TimedOut,
+                "BLE session establishment timed out",
             )));
         }
         Ok(())
@@ -492,7 +566,8 @@ impl TeslaVehicle {
     pub fn request_ble_status(&self) -> TeslaResult<()> {
         if !self.ensure_ble_bridge() {
             return Err(TeslaError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected, "Photon not reachable",
+                std::io::ErrorKind::NotConnected,
+                "Photon not reachable",
             )));
         }
         self.wait_for_ble_session(true, Duration::from_secs(30))?;
@@ -516,8 +591,12 @@ impl TeslaVehicle {
             uuid: rand::random::<[u8; 16]>().to_vec(),
             ..Default::default()
         };
-        state.vcsec_signer.encrypt(&mut message, Duration::from_secs(30))?;
-        if let Some(ref mut b) = state.bridge { b.send(&message)?; }
+        state
+            .vcsec_signer
+            .encrypt(&mut message, Duration::from_secs(30))?;
+        if let Some(ref mut b) = state.bridge {
+            b.send(&message)?;
+        }
         Ok(())
     }
 
@@ -526,10 +605,11 @@ impl TeslaVehicle {
     fn wake_via_ble(&self) -> TeslaResult<()> {
         if !self.ensure_ble_bridge() {
             return Err(TeslaError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected, "Photon not reachable",
+                std::io::ErrorKind::NotConnected,
+                "Photon not reachable",
             )));
         }
-        self.wait_for_ble_session(true, Duration::from_secs(60))?;
+        self.wait_for_ble_session(true, Duration::from_secs(30))?;
         let mut state = self.ble.state.lock().unwrap();
         let payload = UnsignedMessage {
             sub_message: Some(VcsecSubMessage::RkeAction(
@@ -549,7 +629,9 @@ impl TeslaVehicle {
             uuid: rand::random::<[u8; 16]>().to_vec(),
             ..Default::default()
         };
-        state.vcsec_signer.encrypt(&mut message, Duration::from_secs(30))?;
+        state
+            .vcsec_signer
+            .encrypt(&mut message, Duration::from_secs(30))?;
         if let Some(ref mut b) = state.bridge {
             b.send(&message)?;
             info!("BLE wake command sent");
@@ -573,17 +655,25 @@ impl TeslaVehicle {
         let now = Timestamp::now();
         let (vin, last_wake, token) = {
             let cloud = self.cloud.lock().unwrap();
-            (cloud.config.vin.clone(), cloud.last_wake, self.load_user_token_from(&cloud)?)
+            (
+                cloud.config.vin.clone(),
+                cloud.last_wake,
+                self.load_user_token_from(&cloud)?,
+            )
         };
         if let Some(lw) = last_wake {
             if (now - lw).get_hours() < 6 {
-                warn!("Only {} hours since last wake, refusing", (now - lw).get_hours());
+                warn!(
+                    "Only {} hours since last wake, refusing",
+                    (now - lw).get_hours()
+                );
                 return Ok(());
             }
         }
         let url = format!("{COMMAND_API_BASE}/api/1/vehicles/{vin}/wake_up");
         let http = self.cloud.lock().unwrap().http.clone();
-        let resp = match http.post(&url)
+        let resp = match http
+            .post(&url)
             .header("Authorization", &format!("Bearer {}", token.access_token))
             .send(())
         {
@@ -617,7 +707,9 @@ impl TeslaVehicle {
                 // Retry with exponential backoff while the car brings its connection up.
                 let mut total_ms = 0u64;
                 let mut result = Err(TeslaError::CarSleeping);
-                for delay_ms in [500u64, 1000, 2000, 4000, 8000] {
+                for delay_ms in [
+                    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
+                ] {
                     sleep(Duration::from_millis(delay_ms));
                     total_ms += delay_ms;
                     result = self.get_vehicle_data();
@@ -638,9 +730,10 @@ impl TeslaVehicle {
 
         let mut cloud = self.cloud.lock().unwrap();
         trace!("Got vehicle data: {vehicle_data:?}");
-        if cloud.data != vehicle_data {
-            debug!("Vehicle state changed: {}", Comparison::new(&cloud.data, &vehicle_data));
-        }
+        debug!(
+            "Vehicle state changed: {}",
+            Comparison::new(&cloud.data, &vehicle_data)
+        );
         cloud.data = vehicle_data;
         cloud.last_update = Some(Timestamp::now());
         Ok(())
@@ -667,10 +760,15 @@ impl TeslaVehicle {
     pub fn get_vehicle_data(&self) -> TeslaResult<VehicleData> {
         let (url, token, http) = {
             let cloud = self.cloud.lock().unwrap();
-            (vehicle_data_url(&cloud.config.vin), self.load_user_token_from(&cloud)?, cloud.http.clone())
+            (
+                vehicle_data_url(&cloud.config.vin),
+                self.load_user_token_from(&cloud)?,
+                cloud.http.clone(),
+            )
         };
 
-        let mut resp = match http.get(&url)
+        let mut resp = match http
+            .get(&url)
             .header("Authorization", &format!("Bearer {}", token.access_token))
             .call()
         {
@@ -684,13 +782,17 @@ impl TeslaVehicle {
             }
             Err(ureq::Error::StatusCode(408)) => return Err(TeslaError::CarSleeping),
             Err(e) => {
-                if let ureq::Error::StatusCode(code) = &e { error!("Error: {code}"); }
+                if let ureq::Error::StatusCode(code) = &e {
+                    error!("Error: {code}");
+                }
                 return Err(e.into());
             }
         };
 
-        let vehicle_data = resp.body_mut()
-            .read_json::<VehicleDataResponseEnvelope>()?.response;
+        let vehicle_data = resp
+            .body_mut()
+            .read_json::<VehicleDataResponseEnvelope>()?
+            .response;
         validate_charging_state(&vehicle_data.charge_state.charging_state);
         Ok(vehicle_data)
     }
@@ -734,7 +836,10 @@ impl TeslaVehicle {
         info!("Establishing signed command session");
         let (req_bytes, token) = {
             let cloud = self.cloud.lock().unwrap();
-            let req = cloud.signer.session_info_request(Domain::Infotainment).encode_to_vec();
+            let req = cloud
+                .signer
+                .session_info_request(Domain::Infotainment)
+                .encode_to_vec();
             let token = self.load_user_token_from(&cloud)?;
             (req, token)
         };
@@ -746,10 +851,16 @@ impl TeslaVehicle {
         )?;
         let session_info_bytes = match resp_msg.payload {
             Some(Payload::SessionInfo(b)) => b,
-            Some(p) => Err(TeslaError::UnknownCommandResponse("session_info", format!("{p:?}")))?,
+            Some(p) => Err(TeslaError::UnknownCommandResponse(
+                "session_info",
+                format!("{p:?}"),
+            ))?,
             _ => todo!(),
         };
-        self.cloud.lock().unwrap().signer
+        self.cloud
+            .lock()
+            .unwrap()
+            .signer
             .update_session(&SessionInfo::decode(session_info_bytes.as_slice())?)?;
         Ok(())
     }
@@ -765,8 +876,11 @@ impl TeslaVehicle {
             self.establish_session()?;
         }
         let resp_msg = self.dispatch_signed(&action)?;
-        let fault = resp_msg.signed_message_status.as_ref()
-            .map(|s| s.signed_message_fault).unwrap_or(0);
+        let fault = resp_msg
+            .signed_message_status
+            .as_ref()
+            .map(|s| s.signed_message_fault)
+            .unwrap_or(0);
         if matches!(fault, 5 | 6 | 15) {
             info!("Session stale (fault {fault}), re-establishing");
             self.cloud.lock().unwrap().signer.invalidate_session();
@@ -779,10 +893,11 @@ impl TeslaVehicle {
     fn send_ble_command(&self, action: Action) -> TeslaResult<CommandResponse> {
         if !self.ensure_ble_bridge() {
             return Err(TeslaError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected, "Photon not reachable",
+                std::io::ErrorKind::NotConnected,
+                "Photon not reachable",
             )));
         }
-        self.wait_for_ble_session(false, Duration::from_secs(60))?;
+        self.wait_for_ble_session(false, Duration::from_secs(30))?;
         let mut state = self.ble.state.lock().unwrap();
         let mut message = RoutableMessage {
             to_destination: Some(Destination {
@@ -797,9 +912,16 @@ impl TeslaVehicle {
             uuid: rand::random::<[u8; 16]>().to_vec(),
             ..Default::default()
         };
-        state.infotainment_signer.encrypt(&mut message, Duration::from_secs(30))?;
-        if let Some(ref mut b) = state.bridge { b.send(&message)?; }
-        Ok(CommandResponse { result: true, reason: String::new() })
+        state
+            .infotainment_signer
+            .encrypt(&mut message, Duration::from_secs(30))?;
+        if let Some(ref mut b) = state.bridge {
+            b.send(&message)?;
+        }
+        Ok(CommandResponse {
+            result: true,
+            reason: String::new(),
+        })
     }
 
     fn dispatch_signed(&self, action: &Action) -> TeslaResult<RoutableMessage> {
@@ -818,7 +940,9 @@ impl TeslaVehicle {
                 uuid: rand::random::<[u8; 16]>().to_vec(),
                 ..Default::default()
             };
-            cloud.signer.authorize_hmac(&mut message, Duration::from_secs(30))?;
+            cloud
+                .signer
+                .authorize_hmac(&mut message, Duration::from_secs(30))?;
             let token = self.load_user_token_from(&cloud)?;
             let vin = cloud.config.vin.clone();
             (message.encode_to_vec(), token, vin)
@@ -833,8 +957,12 @@ impl TeslaVehicle {
     fn parse_command_response(resp_msg: RoutableMessage) -> TeslaResult<CommandResponse> {
         let bytes = match resp_msg.payload {
             Some(Payload::ProtobufMessageAsBytes(b)) => b,
-            other => return Err(TeslaError::UnknownCommandResponse(
-                "signed_command", format!("unexpected payload: {other:?}"))),
+            other => {
+                return Err(TeslaError::UnknownCommandResponse(
+                    "signed_command",
+                    format!("unexpected payload: {other:?}"),
+                ));
+            }
         };
         Self::parse_command_response_bytes(bytes)
     }
@@ -844,7 +972,9 @@ impl TeslaVehicle {
         let (result, reason) = match response.action_status {
             Some(status) => {
                 let ok = status.result == OperationStatusE::OperationstatusOk as i32;
-                let reason = status.result_reason.and_then(|r| r.reason)
+                let reason = status
+                    .result_reason
+                    .and_then(|r| r.reason)
                     .map(|result_reason::Reason::PlainText(s)| s)
                     .unwrap_or_default();
                 (ok, reason)
@@ -873,21 +1003,33 @@ impl TeslaVehicle {
     fn refresh_token(&self) -> TeslaResult<UserToken> {
         let (client_id, refresh_token_val, http) = {
             let cloud = self.cloud.lock().unwrap();
-            let rt = cloud.config.refresh_token.clone()
+            let rt = cloud
+                .config
+                .refresh_token
+                .clone()
                 .ok_or(TeslaError::AuthError("No refresh token. Run with --auth."))?;
             (cloud.config.client_id.clone(), rt, cloud.http.clone())
         };
 
         #[derive(Deserialize)]
-        struct Resp { access_token: String, refresh_token: String }
-        let resp = http.post(&format!("{AUTH_BASE}/oauth2/v3/token"))
+        struct Resp {
+            access_token: String,
+            refresh_token: String,
+        }
+        let resp = http
+            .post(&format!("{AUTH_BASE}/oauth2/v3/token"))
             .send_form([
                 ("grant_type", "refresh_token"),
                 ("client_id", client_id.as_str()),
                 ("refresh_token", refresh_token_val.as_str()),
-            ])?.into_body().read_json::<Resp>()?;
+            ])?
+            .into_body()
+            .read_json::<Resp>()?;
 
-        let token = UserToken { access_token: resp.access_token, refresh_token: resp.refresh_token };
+        let token = UserToken {
+            access_token: resp.access_token,
+            refresh_token: resp.refresh_token,
+        };
         save_tokens_to_config(&token.access_token, &token.refresh_token)?;
         {
             let mut cloud = self.cloud.lock().unwrap();
@@ -900,11 +1042,19 @@ impl TeslaVehicle {
     fn exchange_code(&self, code: &str, verifier: &str) -> TeslaResult<UserToken> {
         let (http, client_id, client_secret) = {
             let cloud = self.cloud.lock().unwrap();
-            (cloud.http.clone(), cloud.config.client_id.clone(), cloud.config.client_secret.clone())
+            (
+                cloud.http.clone(),
+                cloud.config.client_id.clone(),
+                cloud.config.client_secret.clone(),
+            )
         };
         #[derive(Deserialize)]
-        struct Resp { access_token: String, refresh_token: String }
-        let resp = http.post(&format!("{AUTH_BASE}/oauth2/v3/token"))
+        struct Resp {
+            access_token: String,
+            refresh_token: String,
+        }
+        let resp = http
+            .post(&format!("{AUTH_BASE}/oauth2/v3/token"))
             .send_form([
                 ("grant_type", "authorization_code"),
                 ("client_id", client_id.as_str()),
@@ -913,8 +1063,13 @@ impl TeslaVehicle {
                 ("code_verifier", verifier),
                 ("redirect_uri", REDIRECT_URI),
                 ("audience", COMMAND_API_BASE),
-            ])?.into_body().read_json::<Resp>()?;
-        Ok(UserToken { access_token: resp.access_token, refresh_token: resp.refresh_token })
+            ])?
+            .into_body()
+            .read_json::<Resp>()?;
+        Ok(UserToken {
+            access_token: resp.access_token,
+            refresh_token: resp.refresh_token,
+        })
     }
 
     fn post_authenticated(
@@ -925,7 +1080,8 @@ impl TeslaVehicle {
     ) -> TeslaResult<RoutableMessage> {
         trace!("Sending authenticated post to {url}");
         let http = self.cloud.lock().unwrap().http.clone();
-        let mut resp_body = match http.post(url)
+        let mut resp_body = match http
+            .post(url)
             .header("Authorization", &format!("Bearer {}", token.access_token))
             .send_json(&json_body)
         {
@@ -936,22 +1092,31 @@ impl TeslaVehicle {
                 let http = self.cloud.lock().unwrap().http.clone();
                 http.post(url)
                     .header("Authorization", &format!("Bearer {}", token.access_token))
-                    .send_json(&json_body)?.into_body()
+                    .send_json(&json_body)?
+                    .into_body()
             }
             Err(ureq::Error::StatusCode(408)) => return Err(TeslaError::CarSleeping),
             Err(e) => Err(e)?,
         };
         let resp_json: serde_json::Value = resp_body.read_json()?;
-        let encoded = resp_json["response"].as_str()
-            .ok_or(TeslaError::UnknownCommandResponse("post", "expected string response".into()))?;
-        Ok(RoutableMessage::decode(STANDARD.decode(encoded)?.as_slice())?)
+        let encoded = resp_json["response"]
+            .as_str()
+            .ok_or(TeslaError::UnknownCommandResponse(
+                "post",
+                "expected string response".into(),
+            ))?;
+        Ok(RoutableMessage::decode(
+            STANDARD.decode(encoded)?.as_slice(),
+        )?)
     }
 }
 
 // ── BLE message processing (free function, operates on BleState) ──────────────
 
 fn process_ble_msg(state: &mut BleState, msg: RoutableMessage) {
-    let from_domain = msg.from_destination.as_ref()
+    let from_domain = msg
+        .from_destination
+        .as_ref()
         .and_then(|d| d.sub_destination.as_ref())
         .and_then(|sd| match sd {
             SubDestination::Domain(d) => Some(*d),
@@ -984,20 +1149,33 @@ fn process_ble_msg(state: &mut BleState, msg: RoutableMessage) {
                 if matches!(fault, 5 | 6 | 15) {
                     info!("BLE Infotainment session stale (fault {fault}), re-requesting");
                     state.infotainment_signer.invalidate_session();
-                    let req = state.infotainment_signer.session_info_request(Domain::Infotainment);
-                    if let Some(ref mut b) = state.bridge { let _ = b.send(&req); }
+                    let req = state
+                        .infotainment_signer
+                        .session_info_request(Domain::Infotainment);
+                    if let Some(ref mut b) = state.bridge {
+                        let _ = b.send(&req);
+                    }
                     return;
                 }
             }
             // Log command response.
-            match state.infotainment_signer.decrypt(&msg, Domain::Infotainment as u8) {
+            match state
+                .infotainment_signer
+                .decrypt(&msg, Domain::Infotainment as u8)
+            {
                 Ok(plaintext) => match TeslaVehicle::parse_command_response_bytes(plaintext) {
-                    Ok(cr) if !cr.result => warn!("BLE command result: {}", cr.reason),
+                    Ok(cr) if !cr.result => match cr.reason.as_str() {
+                        "is_charging" => {}
+                        _ => warn!("BLE command result: {}", cr.reason),
+                    },
                     Ok(_) => trace!("BLE command: success"),
                     Err(e) => warn!("BLE decode error: {e}"),
                 },
                 Err(_) => match TeslaVehicle::parse_command_response(msg) {
-                    Ok(cr) if !cr.result => warn!("BLE command result: {}", cr.reason),
+                    Ok(cr) if !cr.result => match cr.reason.as_str() {
+                        "is_charging" => {}
+                        _ => warn!("BLE command result: {}", cr.reason),
+                    },
                     Ok(_) => trace!("BLE command: success (plaintext)"),
                     Err(e) => warn!("BLE parse error: {e}"),
                 },
@@ -1009,12 +1187,15 @@ fn process_ble_msg(state: &mut BleState, msg: RoutableMessage) {
             if let Ok(vcsec) = FromVcsecMessage::decode(bytes.as_slice()) {
                 match vcsec.sub_message {
                     Some(FromVcsecSubMessage::VehicleStatus(vs)) => {
-                        trace!("BLE VehicleStatus: sleep={} presence={}",
-                            vs.vehicle_sleep_status, vs.user_presence);
+                        trace!(
+                            "BLE VehicleStatus: sleep={} presence={}",
+                            vs.vehicle_sleep_status, vs.user_presence
+                        );
                         state.sleep_status = vs.vehicle_sleep_status;
                     }
                     Some(FromVcsecSubMessage::CommandStatus(s))
-                        if s.operation_status == VcsecOperationStatusE::OperationstatusError as i32 =>
+                        if s.operation_status
+                            == VcsecOperationStatusE::OperationstatusError as i32 =>
                     {
                         warn!("BLE VCSEC command error: {s:?}");
                     }
