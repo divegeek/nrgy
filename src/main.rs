@@ -31,8 +31,8 @@ mod units;
 const NORMAL_POLL_INTERVAL: u64 = 10;
 const MIN_CHARGE_AMPS: u8 = 1;
 const MAX_CHARGE_AMPS: u8 = 48;
-const URGENT_CHARGE_THRESHOLD: u8 = 40;
-const SHOULD_CHARGE_THRESHOLD: u8 = 60;
+const URGENT_CHARGE_THRESHOLD: u8 = 30;
+const SHOULD_CHARGE_THRESHOLD: u8 = 50;
 const MIN_BATTERY_SOC: u8 = 90;
 
 #[derive(Error, Debug)]
@@ -209,47 +209,37 @@ fn poll(
     Ok(())
 }
 
-const HIGH_THRESHOLD: f64 = 500.0;
-const LOW_THRESHOLD: f64 = 250.0;
+const HIGH_THRESHOLD: f64 = 1000.0;
+const LOW_THRESHOLD: f64 = 500.0;
 
 fn excess_amps(charging_amps: f64, grid_export: f64, voltage: f64) -> NrgyResult<u8> {
     let car_power = charging_amps * voltage;
 
     if grid_export < LOW_THRESHOLD {
-        return Ok(if charging_amps as u8 > MIN_CHARGE_AMPS {
-            let new_amps = ((charging_amps / 2.0) as u8).max(MIN_CHARGE_AMPS);
-            debug!(
-                "{grid_export:.1} < {LOW_THRESHOLD}, reducing from {charging_amps} to {new_amps}"
-            );
-            new_amps
-        } else if charging_amps as u8 > 0 {
-            debug!("{grid_export:.1} <  {LOW_THRESHOLD}, reducing from {charging_amps} to 0");
-            0
-        } else {
-            debug!("{grid_export:.1} < {LOW_THRESHOLD}, staying at 0");
-            0
-        });
-    }
-
-    if grid_export < HIGH_THRESHOLD {
+        let delta_watts = LOW_THRESHOLD - grid_export + 500.0;
+        let new_watts = car_power - delta_watts;
+        let new_amps = (new_watts / voltage).floor() as u8;
+        info!(
+            "{grid_export:.0} < {LOW_THRESHOLD}, reducing from {car_power:.0}W \
+             ({charging_amps:.1}A) to {new_watts:.0}W ({new_amps}A)."
+        );
+        return Ok(new_amps);
+    } else if grid_export < HIGH_THRESHOLD {
+        info!(
+            "{LOW_THRESHOLD:.0}W <= {grid_export:.0}W <= {HIGH_THRESHOLD:.0}, staying at {charging_amps:.0}"
+        );
         return Ok(charging_amps as u8);
-    }
-
-    let excess_power = grid_export + car_power - LOW_THRESHOLD;
-    let excess_amps = excess_power / voltage;
-    let new_amps =
-        ((charging_amps + (excess_amps - charging_amps) / 2.0) as u8).clamp(0, MAX_CHARGE_AMPS);
-
-    let target_amps = if new_amps >= MIN_CHARGE_AMPS {
-        new_amps
     } else {
-        0
-    };
+        let excess_power = grid_export + car_power - LOW_THRESHOLD;
+        let excess_amps = excess_power / voltage;
+        let new_amps =
+            ((charging_amps + (excess_amps - charging_amps) / 3.0) as u8).clamp(0, MAX_CHARGE_AMPS);
 
-    debug!(
-        "Excess power {excess_power:.1} -> excess amps {excess_amps:.1} -> adjust from \
-    {charging_amps:.1} to new amps {new_amps} -> target {target_amps}",
-    );
+        info!(
+            "Excess power {excess_power:.0}W ({excess_amps:.1}A). Adjust from \
+         {charging_amps:.1}A to new amps {new_amps}",
+        );
 
-    Ok(target_amps)
+        Ok(new_amps)
+    }
 }

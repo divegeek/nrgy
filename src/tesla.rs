@@ -2,7 +2,7 @@ use std::{
     io::{self, BufRead},
     sync::{Arc, Condvar, Mutex},
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{
@@ -553,6 +553,7 @@ impl TeslaVehicle {
             })
             .unwrap();
         if timed_out.timed_out() {
+            self.ble.state.lock().unwrap().bridge = None;
             return Err(TeslaError::IoError(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "BLE session establishment timed out",
@@ -704,24 +705,23 @@ impl TeslaVehicle {
             Ok(data) => data,
             Err(e) => {
                 self.handle_sleeping_car(e, update_age)?;
-                // Retry with exponential backoff while the car brings its connection up.
-                let mut total_ms = 0u64;
-                let mut result = Err(TeslaError::CarSleeping);
-                for delay_ms in [
-                    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
-                ] {
-                    sleep(Duration::from_millis(delay_ms));
-                    total_ms += delay_ms;
+                // Retry while the car brings its connection up.
+                let mut result;
+                let start = Instant::now();
+                loop {
+                    sleep(Duration::from_millis(1000));
                     result = self.get_vehicle_data();
                     if result.is_ok() {
-                        info!("Fleet API ready after {total_ms}ms");
+                        info!("Fleet API ready after {:?}", start.elapsed());
+                        break;
+                    } else if start.elapsed().as_millis() > 10000 {
                         break;
                     }
                 }
                 match result {
                     Ok(data) => data,
                     Err(e) => {
-                        warn!("Fleet API not ready after {total_ms}ms");
+                        warn!("Fleet API not ready after {:?}", start.elapsed());
                         return Err(e);
                     }
                 }
